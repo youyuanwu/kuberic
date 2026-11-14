@@ -43,6 +43,9 @@ struct Store {
     unsupported: Option<String>,
     conflict: Option<(Kind, bool)>,
     lose_response: Option<(Kind, bool)>,
+    delete_conflict: Option<Kind>,
+    lose_delete_response: Option<Kind>,
+    deletes: Vec<(Kind, String, String, Option<i64>)>,
 }
 
 impl Store {
@@ -80,6 +83,40 @@ impl MockApi {
 
     pub fn lose_next_response(&self, kind: Kind, status: bool) {
         self.store.lock().unwrap().lose_response = Some((kind, status));
+    }
+
+    pub fn conflict_next_delete(&self, kind: Kind) {
+        self.store.lock().unwrap().delete_conflict = Some(kind);
+    }
+
+    pub fn lose_next_delete_response(&self, kind: Kind) {
+        self.store.lock().unwrap().lose_delete_response = Some(kind);
+    }
+
+    pub fn deletes(&self) -> Vec<(Kind, String, String, Option<i64>)> {
+        self.store.lock().unwrap().deletes.clone()
+    }
+
+    pub fn finalize(&self, namespace: &str, kind: Kind, name: &str, uid: &str) {
+        let mut store = self.store.lock().unwrap();
+        let key = (namespace.to_owned(), kind, name.to_owned());
+        let object = store.objects.get(&key).expect("deleting object exists");
+        assert_eq!(
+            object["metadata"]["uid"], uid,
+            "cannot finalize another incarnation"
+        );
+        assert!(
+            !object["metadata"]["deletionTimestamp"].is_null(),
+            "deletion was not requested"
+        );
+        assert!(
+            object["metadata"]["finalizers"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "foreign finalizer remains"
+        );
+        store.objects.remove(&key);
+        store.revision();
     }
 
     pub fn check(&self) {
@@ -265,12 +302,55 @@ fn execute(
                 return Err(conflict("delete resourceVersion changed"));
             }
         }
-        store.objects.remove(&key);
-        store.revision();
-        return Ok((
-            200,
-            json!({"apiVersion":"v1", "kind":"Status", "status":"Success", "code":200}),
+        if store.delete_conflict == Some(route.kind) {
+            store.delete_conflict = None;
+            let mut bumped = old;
+            bumped["metadata"]["resourceVersion"] = store.revision();
+            store.objects.insert(key, bumped);
+            return Err(conflict("injected concurrent deletion update"));
+        }
+        if !old["metadata"]["deletionTimestamp"].is_null() {
+            return Ok((200, old));
+        }
+        let grace = options["gracePeriodSeconds"].as_i64();
+        let finalizers = old["metadata"]["finalizers"]
+            .as_array()
+            .is_some_and(|finalizers| !finalizers.is_empty());
+        let held = finalizers || (route.kind == Kind::Pod && grace != Some(0));
+        let mut deleted = old.clone();
+        deleted["metadata"]["deletionTimestamp"] =
+            serde_json::to_value(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ))
+            .unwrap();
+        if route.kind == Kind::Pod {
+            deleted["metadata"]["deletionGracePeriodSeconds"] = json!(grace.unwrap_or(30));
+        }
+        if route.kind == Kind::Set {
+            deleted["metadata"]["generation"] =
+                json!(old["metadata"]["generation"].as_i64().unwrap() + 1);
+        }
+        deleted["metadata"]["resourceVersion"] = store.revision();
+        store.deletes.push((
+            route.kind,
+            name.clone(),
+            old["metadata"]["uid"].as_str().unwrap().into(),
+            grace,
         ));
+        if held {
+            store.objects.insert(key, deleted.clone());
+        } else {
+            store.objects.remove(&key);
+        }
+        if store.lose_delete_response == Some(route.kind) {
+            store.lose_delete_response = None;
+            return Err(Failure(
+                500,
+                "InternalError",
+                "injected lost deletion response after commit".into(),
+            ));
+        }
+        return Ok((200, deleted));
     }
     if parts.method != Method::PUT {
         return Err(store.unsupported(format!("method {} {}", parts.method, parts.uri)));
@@ -281,6 +361,23 @@ fn execute(
         || incoming["metadata"]["resourceVersion"] != old["metadata"]["resourceVersion"]
     {
         return Err(conflict("UID/resourceVersion changed"));
+    }
+    if !route.status && !old["metadata"]["deletionTimestamp"].is_null() {
+        if incoming["metadata"]["deletionTimestamp"] != old["metadata"]["deletionTimestamp"] {
+            return Err(bad("deletionTimestamp is immutable"));
+        }
+        if incoming["metadata"]["finalizers"]
+            .as_array()
+            .is_some_and(|finalizers| {
+                finalizers.iter().any(|finalizer| {
+                    !old["metadata"]["finalizers"]
+                        .as_array()
+                        .is_some_and(|old| old.contains(finalizer))
+                })
+            })
+        {
+            return Err(bad("new finalizers cannot be added during deletion"));
+        }
     }
     if store.conflict == Some((route.kind, route.status)) {
         store.conflict = None;
@@ -320,7 +417,17 @@ fn execute(
         next
     };
     next["metadata"]["resourceVersion"] = store.revision();
-    store.objects.insert(key, next.clone());
+    if !route.status
+        && route.kind != Kind::Pod
+        && !next["metadata"]["deletionTimestamp"].is_null()
+        && next["metadata"]["finalizers"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    {
+        store.objects.remove(&key);
+    } else {
+        store.objects.insert(key, next.clone());
+    }
     if store.lose_response == Some((route.kind, route.status)) {
         store.lose_response = None;
         return Err(Failure(

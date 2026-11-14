@@ -18,6 +18,8 @@ pub const POD_UID: &str = "operator.kuberic.io/pod-uid";
 pub const DEPLOYMENT: &str = "operator.kuberic.io/deployment";
 pub const SPEC: &str = "operator.kuberic.io/frozen-spec";
 pub const CONTROLLER: &str = "kuberic-controller";
+pub const FINALIZER: &str = "operator.kuberic.io/owned-teardown";
+pub const RUN_ROOT: &str = "/run/fube";
 
 pub fn write_service_name(name: &str) -> String {
     format!("{name}-write")
@@ -73,10 +75,11 @@ pub fn pod(set: &KubericSet, allocation: &Allocation, node: usize) -> Result<Pod
         .labels
         .get_or_insert_default()
         .insert(NODE_ID.into(), assigned.node_id.clone());
-    let parent = PathBuf::from(&allocation.settings.run_root).join(&allocation.deployment);
+    let parent = PathBuf::from(RUN_ROOT).join(&allocation.deployment);
     Ok(Pod {
         metadata,
         spec: Some(PodSpec {
+            automount_service_account_token: Some(false),
             restart_policy: Some("Never".into()),
             containers: vec![Container {
                 name: "node".into(),
@@ -92,7 +95,7 @@ pub fn pod(set: &KubericSet, allocation: &Allocation, node: usize) -> Result<Pod
                 }]),
                 volume_mounts: Some(vec![
                     VolumeMount { name: "config".into(), mount_path: "/etc/fube".into(), read_only: Some(true), ..VolumeMount::default() },
-                    VolumeMount { name: "run".into(), mount_path: allocation.settings.run_root.clone(), ..VolumeMount::default() },
+                    VolumeMount { name: "run".into(), mount_path: RUN_ROOT.into(), ..VolumeMount::default() },
                 ]),
                 ..Container::default()
             }],
@@ -165,7 +168,7 @@ pub fn runner_config(cohort: &FrozenCohort, index: usize) -> Result<fube_node_ru
             .into_iter()
             .map(|(name, value)| (name, value.replace("{node_ip}", &binding.ip)))
             .collect(),
-        run_directory: PathBuf::from(&allocation.settings.run_root)
+        run_directory: PathBuf::from(RUN_ROOT)
             .join(&allocation.deployment)
             .join(&binding.pod_uid),
         startup_timeout_ms: 30_000,

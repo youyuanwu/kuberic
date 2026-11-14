@@ -1,4 +1,4 @@
-mod support;
+use kuberic_tests::controller as support;
 
 use std::{
     collections::BTreeMap,
@@ -13,7 +13,7 @@ use kube::{
 use kuberic_controller::{
     evaluate,
     resources::{self, POD_UID},
-    ControllerPhase, FmApi, KubericSet, Plan, ProcessFm, Reconciler,
+    ControllerPhase, FmApi, KubericSet, Plan, ProcessFm, Reconciler, StaleObservation,
 };
 
 use support::{api::Kind, Fixture, NAME, NAMESPACE};
@@ -136,6 +136,7 @@ async fn bootstrap_observes_pods_but_native_replies_alone_authorize_routing() {
         fixture.client.clone(),
         support::settings(),
         fixture.fm.clone(),
+        fixture.processes.clone(),
     )
     .unwrap();
     assert!(!recreated.reconcile(NAME).await.unwrap().changed);
@@ -153,6 +154,9 @@ async fn cohort_uid_ip_loss_and_restart_withdraw_routing_without_replacement() {
         match fault {
             0 | 2 => {
                 delete(&pod_api, &pod).await;
+                fixture
+                    .api
+                    .finalize(NAMESPACE, Kind::Pod, &pod.name_any(), &pod.uid().unwrap());
                 if fault == 0 {
                     let mut replacement = pod.clone();
                     replacement.metadata.uid = None;
@@ -248,6 +252,7 @@ async fn status_loss_or_new_fm_owner_cannot_adopt_existing_resources() {
         fixture.client.clone(),
         support::settings(),
         fresh_fm.clone(),
+        fixture.processes.clone(),
     )
     .unwrap();
     assert!(restarted.reconcile(NAME).await.unwrap().blocked.is_some());
@@ -282,6 +287,7 @@ async fn status_loss_or_new_fm_owner_cannot_adopt_existing_resources() {
 #[tokio::test]
 async fn foreign_owned_objects_and_namespaces_are_never_mutated_or_adopted() {
     let fixture = Fixture::new().await;
+    fixture.controller.reconcile(NAME).await.unwrap();
     let services: Api<Service> = Api::namespaced(fixture.client.clone(), NAMESPACE);
     let foreign = services
         .create(
@@ -331,6 +337,7 @@ async fn foreign_owned_objects_and_namespaces_are_never_mutated_or_adopted() {
 #[tokio::test]
 async fn committed_status_survives_lost_response_and_config_conflict_never_means_completion() {
     let fixture = Fixture::new().await;
+    fixture.controller.reconcile(NAME).await.unwrap();
     fixture.api.lose_next_response(Kind::Set, true);
     assert!(fixture.controller.reconcile(NAME).await.is_err());
     let deployment = fixture
@@ -354,7 +361,7 @@ async fn committed_status_survives_lost_response_and_config_conflict_never_means
     for _ in 0..16 {
         let observation = fixture.controller.observe(NAME).await.unwrap();
         if matches!(
-            evaluate(&observation, &support::settings(), fixture.fm.owner_id()),
+            evaluate(&observation, &support::settings()),
             Plan::ConfigureNode(_)
         ) {
             break;
@@ -400,11 +407,19 @@ async fn stale_pod_snapshot_cannot_start_a_native_fm_session() {
     }
     fixture.controller.reconcile(NAME).await.unwrap();
     let observation = fixture.controller.observe(NAME).await.unwrap();
-    let plan = evaluate(&observation, &support::settings(), fixture.fm.owner_id());
+    let plan = evaluate(&observation, &support::settings());
     assert!(matches!(plan, Plan::StartFm(_)));
     let pod = observation.pods[0].as_ref().unwrap();
     support::publish_ip(&fixture.client, pod, "127.0.0.9", true).await;
-    assert!(fixture.controller.apply(&observation, plan).await.is_err());
+    let error = fixture
+        .controller
+        .apply(&observation, plan)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<StaleObservation>(),
+        Some(&StaleObservation::Resources)
+    );
     assert_eq!(fixture.fm.starts.load(Ordering::SeqCst), 0);
     assert!(fixture
         .controller
@@ -417,15 +432,38 @@ async fn stale_pod_snapshot_cannot_start_a_native_fm_session() {
 }
 
 #[tokio::test]
+async fn native_transition_rejects_stale_routing_as_retryable_without_publishing() {
+    let fixture = Fixture::new().await;
+    fixture.provision().await;
+    fixture.fm.create().await;
+    let observation = fixture.controller.observe(NAME).await.unwrap();
+    let plan = evaluate(&observation, &support::settings());
+    assert!(matches!(plan, Plan::Route(_)));
+    let cohort = observation.set.status.as_ref().unwrap().cohort().unwrap();
+    fixture.fm.shutdown(&cohort).await.unwrap();
+    let error = fixture
+        .controller
+        .apply(&observation, plan)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<StaleObservation>(),
+        Some(&StaleObservation::Premise)
+    );
+    assert_disabled(&fixture).await;
+    fixture.api.check();
+}
+
+#[tokio::test]
 async fn guarded_process_fm_invalidates_and_joins_without_admitting_a_successor() {
     let fixture = Fixture::new().await;
     fixture.provision().await;
     let mut cohort = fixture.set().await.status.unwrap().cohort().unwrap();
     let fm = ProcessFm::new();
-    cohort.allocation.fm_owner = fm.owner_id().into();
     let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    cohort.allocation.settings.fm.address = reserved.local_addr().unwrap().to_string();
+    cohort.allocation.fm.address = reserved.local_addr().unwrap().to_string();
     drop(reserved);
+    fm.reserve(&cohort.allocation).await.unwrap();
     fm.start(&cohort).await.unwrap();
     fm.invalidate(&cohort, "original Pod UID changed")
         .await
@@ -436,6 +474,6 @@ async fn guarded_process_fm_invalidates_and_joins_without_admitting_a_successor(
     );
     assert!(fm.start(&cohort).await.is_err());
     assert!(fm.join().await.is_err());
-    let listener = std::net::TcpListener::bind(&cohort.allocation.settings.fm.address).unwrap();
+    let listener = std::net::TcpListener::bind(&cohort.allocation.fm.address).unwrap();
     drop(listener);
 }

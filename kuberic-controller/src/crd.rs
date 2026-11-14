@@ -77,15 +77,6 @@ impl FmAuthority {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Settings {
-    pub namespace: String,
-    pub fm: FmAuthority,
-    pub node_port: u16,
-    pub run_root: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeAllocation {
     pub node_id: String,
     pub replica_id: i64,
@@ -98,11 +89,11 @@ pub struct NodeAllocation {
 pub struct Allocation {
     pub resource_uid: String,
     pub resource_name: String,
+    pub namespace: String,
     pub generation: i64,
     pub deployment: String,
     pub partition: String,
-    pub fm_owner: String,
-    pub settings: Settings,
+    pub fm: FmAuthority,
     pub spec: KubericSetSpec,
     pub nodes: Vec<NodeAllocation>,
 }
@@ -113,6 +104,7 @@ pub struct Binding {
     pub pod_uid: String,
     pub config_map_uid: String,
     pub ip: String,
+    pub control_port: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -132,7 +124,7 @@ impl FrozenCohort {
         let config = kuberic_fm::Config {
             schema_version: 1,
             deployment: allocation.deployment.clone(),
-            fm: allocation.settings.fm.native()?,
+            fm: allocation.fm.native()?,
             nodes: allocation
                 .nodes
                 .iter()
@@ -143,10 +135,7 @@ impl FrozenCohort {
                             id: node.node_id.clone(),
                             instance: 1,
                         },
-                        address: SocketAddrV4::new(
-                            binding.ip.parse()?,
-                            allocation.settings.node_port,
-                        ),
+                        address: SocketAddrV4::new(binding.ip.parse()?, binding.control_port),
                         replica_id: node.replica_id,
                         replica_instance: 1,
                     })
@@ -177,6 +166,32 @@ pub enum ControllerPhase {
     Blocked,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TeardownStage {
+    NativeDeletion,
+    Pods,
+    Resources,
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Teardown {
+    pub cohort: FrozenCohort,
+    pub service_uid: String,
+    pub started_unix_ms: u64,
+    pub deadline_unix_ms: u64,
+    pub stage: TeardownStage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootstrapWait {
+    pub started_unix_ms: u64,
+    pub deadline_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KubericSetStatus {
@@ -185,6 +200,10 @@ pub struct KubericSetStatus {
     pub bindings: Option<Vec<Binding>>,
     pub service_endpoint: Option<String>,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub bootstrap_wait: Option<BootstrapWait>,
+    #[serde(default)]
+    pub teardown: Option<Teardown>,
 }
 
 impl KubericSetStatus {

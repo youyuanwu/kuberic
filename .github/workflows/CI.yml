@@ -42,10 +42,54 @@ jobs:
       - name: Build workspace documentation
         run: cargo doc --locked --workspace --no-deps
 
-      - name: Build fube process fixtures
-        run: |
-          cargo build --locked --manifest-path fube/Cargo.toml \
-            -p fube-node-runner -p hosting-local-app --bins --target-dir target
-
       - name: Test workspace including process journeys
-        run: cargo test --locked --workspace -- --include-ignored
+        run: cargo test --locked --workspace
+
+  kind:
+    name: KinD lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KIND_CLUSTER_NAME: kuberic-fube-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBE_CONTEXT: kind-kuberic-fube-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBECONFIG: ${{ github.workspace }}/target/kind/test.kubeconfig
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+
+      - uses: taiki-e/install-action@just
+
+      - name: Prepare dedicated kubeconfig directory
+        run: mkdir -p "$(dirname "$KUBECONFIG")"
+
+      - name: Create isolated KinD cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.30.0
+          node_image: kindest/node:v1.34.0
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          config: kuberic-kind-tests/deploy/kind-config.yaml
+          kubeconfig: ${{ env.KUBECONFIG }}
+
+      - name: Record dedicated cluster ownership
+        run: |
+          printf 'cluster=%s\ncontext=%s\nkubeconfig=%s\n' \
+            "$KIND_CLUSTER_NAME" "$KUBE_CONTEXT" "$KUBECONFIG" \
+            | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+          just verify-kind-context
+
+      - name: Run real-cluster journeys
+        run: just kind-test
+
+      - name: Collect diagnostics
+        if: failure()
+        run: just kind-diagnostics
+
+      - name: Delete owned cluster
+        if: always()
+        run: just delete-kind-cluster
