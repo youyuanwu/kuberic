@@ -114,111 +114,148 @@ pub async fn run(scenario: Scenario) -> Result<()> {
             })
         );
         if scenario == Scenario::PrimaryAppFailover {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                let state: serde_json::Value =
-                    serde_json::from_str(&application(&endpoint, "state").await?)?;
-                let peers = state["peers"].as_array().context("replication peers")?;
-                if peers.len() == 2
-                    && peers
-                        .iter()
-                        .all(|peer| peer["applied"].as_i64().is_some_and(|lsn| lsn >= 1))
-                {
-                    break;
+            let mut previous_endpoint = started
+                .status
+                .as_ref()
+                .and_then(|status| status.service_endpoint.clone());
+            for (cycle, victim, primary, before, command, after) in [
+                (0, 1, 0, "acknowledged", "write-more", "continued"),
+                (1, 0, 1, "continued", "write-final", "final"),
+            ] {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let state: serde_json::Value =
+                        serde_json::from_str(&application(&endpoint, "state").await?)?;
+                    let peers = state["peers"].as_array().context("replication peers")?;
+                    let last = state["provider"]["last"].as_i64().context("provider LSN")?;
+                    if peers.len() == 2
+                        && last >= 1
+                        && peers
+                            .iter()
+                            .all(|peer| peer["applied"].as_i64().is_some_and(|lsn| lsn >= last))
+                    {
+                        break;
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "original peers did not apply: {state}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                ensure!(
-                    Instant::now() < deadline,
-                    "original peers did not apply: {state}"
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "failover_ready", "set_uid": uid, "cohort": cohort,
+                        "cycle": cycle, "victim": victim
+                    })
                 );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "failover_ready", "set_uid": uid, "cohort": cohort
-                })
-            );
-            let deadline = Instant::now() + Duration::from_secs(180);
-            let promoted = loop {
-                let current = sets.get(&name).await?;
-                let status = current.status.as_ref().context("failover status")?;
+                let deadline = Instant::now() + Duration::from_secs(180);
+                let promoted = loop {
+                    let current = sets.get(&name).await?;
+                    let status = current.status.as_ref().context("failover status")?;
+                    ensure!(
+                        current.uid().as_deref() == Some(&uid)
+                            && status.cohort().as_ref() == Some(&cohort)
+                            && status.phase != ControllerPhase::Blocked,
+                        "failover changed original authority or blocked: {current:?}"
+                    );
+                    if status.phase == ControllerPhase::Serving
+                        && status.primary_node_id.as_ref()
+                            == Some(&cohort.allocation.nodes[primary].node_id)
+                    {
+                        break current;
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "deployed failover timed out: {current:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                };
+                let service = services.get(&resources::write_service_name(&name)).await?;
                 ensure!(
-                    current.uid().as_deref() == Some(&uid)
-                        && status.cohort().as_ref() == Some(&cohort)
-                        && status.phase != ControllerPhase::Blocked,
-                    "failover changed original authority or blocked: {current:?}"
-                );
-                if status.phase == ControllerPhase::Serving
-                    && status.primary_node_id.as_ref() == Some(&cohort.allocation.nodes[0].node_id)
-                {
-                    break current;
-                }
-                ensure!(
-                    Instant::now() < deadline,
-                    "deployed failover timed out: {current:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            };
-            let service = services.get(&resources::write_service_name(&name)).await?;
-            ensure!(
-                service
-                    .spec
-                    .as_ref()
-                    .and_then(|spec| spec.selector.as_ref())
-                    .and_then(|selector| selector.get(resources::POD_UID))
-                    == Some(&cohort.bindings[0].pod_uid)
-                    && promoted
-                        .status
+                    service
+                        .spec
                         .as_ref()
-                        .and_then(|status| status.service_endpoint.as_ref())
-                        != started
+                        .and_then(|spec| spec.selector.as_ref())
+                        .and_then(|selector| selector.get(resources::POD_UID))
+                        == Some(&cohort.bindings[primary].pod_uid)
+                        && promoted
                             .status
                             .as_ref()
-                            .and_then(|status| status.service_endpoint.as_ref()),
-                "failover did not publish the new original primary"
-            );
-            wait_for_service(&endpoint).await?;
-            let preserved = application(&endpoint, "read").await?;
-            let written = application(&endpoint, "write-more").await?;
-            let continued = application(&endpoint, "read").await?;
-            ensure!(
-                preserved.contains("value=acknowledged")
+                            .and_then(|status| status.service_endpoint.as_ref())
+                            != previous_endpoint.as_ref(),
+                    "failover did not publish the new original primary"
+                );
+                wait_for_service(&endpoint).await?;
+                let preserved = application(&endpoint, "read").await?;
+                let written = application(&endpoint, command).await?;
+                let continued = application(&endpoint, "read").await?;
+                ensure!(
+                preserved.contains(&format!("value={before}"))
                     && written.starts_with("OK")
-                    && continued.contains("value=continued"),
+                    && continued.contains(&format!("value={after}")),
                 "failover lost data or stopped writes: {preserved:?}; {written:?}; {continued:?}"
             );
-            for (node, binding) in cohort.allocation.nodes.iter().zip(&cohort.bindings) {
-                let pod = Api::<Pod>::namespaced(client.clone(), &namespace)
-                    .get(&node.pod_name)
-                    .await?;
-                ensure!(
-                    pod.uid().as_deref() == Some(&binding.pod_uid)
-                        && pod.metadata.deletion_timestamp.is_none()
-                        && pod
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| status.phase.as_deref() == Some("Running")
-                                && status
-                                    .container_statuses
-                                    .as_ref()
-                                    .is_some_and(|containers| containers.iter().all(
-                                        |container| container.restart_count == 0
+                for (node, binding) in cohort.allocation.nodes.iter().zip(&cohort.bindings) {
+                    let pod = Api::<Pod>::namespaced(client.clone(), &namespace)
+                        .get(&node.pod_name)
+                        .await?;
+                    ensure!(
+                        pod.uid().as_deref() == Some(&binding.pod_uid)
+                            && pod.metadata.deletion_timestamp.is_none()
+                            && pod
+                                .status
+                                .as_ref()
+                                .is_some_and(|status| status.phase.as_deref() == Some("Running")
+                                    && status.container_statuses.as_ref().is_some_and(
+                                        |containers| containers.iter().all(|container| container
+                                            .restart_count
+                                            == 0
                                             && container
                                                 .state
                                                 .as_ref()
-                                                .is_some_and(|state| state.running.is_some())
-                                    ))),
-                    "application failover replaced or restarted an original node: {pod:?}"
+                                                .is_some_and(|state| state.running.is_some()))
+                                    )),
+                        "application failover replaced or restarted an original node: {pod:?}"
+                    );
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "primary_app_failover", "set_uid": uid, "cohort": cohort,
+                        "primary_node_id": cohort.allocation.nodes[primary].node_id,
+                        "cycle": cycle,
+                        "data_preserved": true, "writes_continued": true, "original_nodes_unchanged": true
+                    })
                 );
+                previous_endpoint = promoted
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.service_endpoint.clone());
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "repair_complete", "set_uid": uid, "cohort": cohort,
+                        "cycle": cycle, "victim": victim
+                    })
+                );
+                let maps: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    if let Some(receipt) = maps.get_opt(&format!("host-restored-{cycle}")).await? {
+                        ensure!(
+                            receipt.data.as_ref().and_then(|data| data.get("setUid")) == Some(&uid),
+                            "host restoration evidence changed cohort"
+                        );
+                        break;
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "host did not verify physical restoration"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
             }
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "primary_app_failover", "set_uid": uid, "cohort": cohort,
-                    "primary_node_id": cohort.allocation.nodes[0].node_id,
-                    "data_preserved": true, "writes_continued": true, "original_nodes_unchanged": true
-                })
-            );
         }
     }
     sets.delete(

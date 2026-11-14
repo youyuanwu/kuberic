@@ -85,6 +85,9 @@ async fn deleting_during_primary_reconfiguration_finishes_it_without_client_publ
     let command = fixture.fm.command().await;
     fixture.fm.complete(&command).await;
     drive_unrouted(&fixture).await;
+    assert!(fixture.set().await.status.unwrap().teardown.is_none());
+    fixture.fm.restore().await;
+    drive_unrouted(&fixture).await;
     let status = fixture.set().await.status.unwrap();
     assert_eq!(status.cohort().as_ref(), Some(&cohort));
     assert_eq!(

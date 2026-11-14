@@ -334,6 +334,8 @@ impl Cluster {
     fn wait_for_scenario(&self, namespace: &str, scenario: Scenario) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(600);
         let mut original_operator = None;
+        let mut faults = BTreeMap::<u64, Value>::new();
+        let mut restored = std::collections::BTreeSet::new();
         loop {
             let job: Value = serde_json::from_str(
                 &self.kubectl(&["-n", namespace, "get", "job", "driver", "-o", "json"])?,
@@ -343,7 +345,7 @@ impl Cluster {
                 "in-cluster driver failed: {}",
                 job["status"]
             );
-            if scenario == Scenario::PrimaryAppFailover && original_operator.is_none() {
+            if scenario == Scenario::PrimaryAppFailover {
                 let pods: Value = serde_json::from_str(&self.kubectl(&[
                     "-n",
                     namespace,
@@ -372,8 +374,41 @@ impl Cluster {
                     for line in logs.lines().filter(|line| line.starts_with('{')) {
                         let event: Value = serde_json::from_str(line)?;
                         if event["event"] == "failover_ready" {
-                            original_operator = Some(self.crash_primary_app(namespace, &event)?);
-                            break;
+                            let cycle = event["cycle"].as_u64().context("fault cycle")?;
+                            if !faults.contains_key(&cycle) {
+                                ensure!(
+                                    cycle == u64::try_from(faults.len())? && cycle < 2,
+                                    "unexpected fault cycle"
+                                );
+                                let (operator, report) =
+                                    self.crash_primary_app(namespace, &event)?;
+                                ensure!(
+                                    original_operator
+                                        .as_ref()
+                                        .is_none_or(|original| original == &operator),
+                                    "restoration changed the original operator"
+                                );
+                                original_operator = Some(operator);
+                                faults.insert(
+                                    cycle,
+                                    json!({"cohort": event["cohort"], "report": report}),
+                                );
+                            }
+                        } else if event["event"] == "repair_complete" {
+                            let cycle = event["cycle"].as_u64().context("repair cycle")?;
+                            if !restored.contains(&cycle) {
+                                ensure!(
+                                    original_operator.as_ref()
+                                        == Some(&self.operator_uid(namespace)?),
+                                    "repair changed the original operator"
+                                );
+                                self.verify_restoration(
+                                    namespace,
+                                    &event,
+                                    faults.get(&cycle).context("repair has no original fault")?,
+                                )?;
+                                restored.insert(cycle);
+                            }
                         }
                     }
                 }
@@ -404,6 +439,11 @@ impl Cluster {
             })
             .context("successful driver omitted final lifecycle verification")?;
         if scenario == Scenario::PrimaryAppFailover {
+            ensure!(
+                faults.keys().copied().collect::<Vec<_>>() == [0, 1]
+                    && restored.iter().copied().collect::<Vec<_>>() == [0, 1],
+                "repeated failover omitted verified native restoration"
+            );
             ensure!(
                 original_operator.as_ref() == Some(&self.operator_uid(namespace)?),
                 "failover lost or restarted the original operator"
@@ -451,6 +491,7 @@ impl Cluster {
             if scenario == Scenario::PrimaryAppFailover {
                 let promoted = events
                     .iter()
+                    .rev()
                     .find(|event| event["event"] == "primary_app_failover")
                     .context("missing promoted primary")?;
                 ensure!(
@@ -525,10 +566,12 @@ impl Cluster {
             .into())
     }
 
-    fn crash_primary_app(&self, namespace: &str, event: &Value) -> Result<String> {
+    fn crash_primary_app(&self, namespace: &str, event: &Value) -> Result<(String, Value)> {
         let cohort: kuberic_operator::FrozenCohort =
             serde_json::from_value(event["cohort"].clone())?;
         cohort.fm_config()?;
+        let index = usize::try_from(event["victim"].as_u64().context("fault victim")?)?;
+        ensure!(index < cohort.bindings.len(), "foreign fault victim");
         let set: kuberic_operator::KubericSet = serde_json::from_str(&self.kubectl(&[
             "-n",
             namespace,
@@ -548,34 +591,11 @@ impl Cluster {
                     .is_some_and(|status| status.cohort().as_ref() == Some(&cohort)
                         && status.phase == kuberic_operator::ControllerPhase::Serving
                         && status.primary_node_id.as_ref()
-                            == Some(&cohort.allocation.nodes[1].node_id)),
+                            == Some(&cohort.allocation.nodes[index].node_id)),
             "fault request changed original Serving authority"
         );
-        let name = &cohort.allocation.nodes[1].pod_name;
-        let pod: k8s_openapi::api::core::v1::Pod = serde_json::from_str(
-            &self.kubectl(&["-n", namespace, "get", "pod", name, "-o", "json"])?,
-        )?;
-        ensure!(
-            pod.uid().as_deref() == Some(&cohort.bindings[1].pod_uid)
-                && pod.metadata.deletion_timestamp.is_none()
-                && pod
-                    .owner_references()
-                    .iter()
-                    .any(|owner| owner.controller == Some(true)
-                        && owner.uid == cohort.allocation.resource_uid)
-                && pod.labels().get(kuberic_operator::resources::POD_UID)
-                    == Some(&cohort.bindings[1].pod_uid)
-                && pod.status.as_ref().is_some_and(|status| status
-                    .container_statuses
-                    .as_ref()
-                    .is_some_and(|containers| containers.len() == 1
-                        && containers[0].restart_count == 0
-                        && containers[0]
-                            .state
-                            .as_ref()
-                            .is_some_and(|state| state.running.is_some()))),
-            "fault target is not the running original primary Pod"
-        );
+        self.original_pod(namespace, &cohort, index)?;
+        let name = &cohort.allocation.nodes[index].pod_name;
         let operator = self.operator_uid(namespace)?;
         let logs = self.kubectl(&[
             "-n",
@@ -589,19 +609,129 @@ impl Cluster {
             "crash-primary-app",
             "--cohort",
             &serde_json::to_string(&cohort)?,
+            "--node-index",
+            &index.to_string(),
         ])?;
         let report: Value = serde_json::from_str(logs.trim())?;
         ensure!(
             report["event"] == "primary_app_crashed"
                 && report["set_uid"] == cohort.allocation.resource_uid
-                && report["pod_uid"] == cohort.bindings[1].pod_uid
+                && report["pod_uid"] == cohort.bindings[index].pod_uid
                 && report["application_pid"]
                     .as_u64()
                     .is_some_and(|pid| pid > 1),
             "fault injector omitted original application-crash evidence"
         );
         eprintln!("{logs}");
-        Ok(operator)
+        Ok((operator, report))
+    }
+
+    fn original_pod(
+        &self,
+        namespace: &str,
+        cohort: &kuberic_operator::FrozenCohort,
+        index: usize,
+    ) -> Result<()> {
+        ensure!(
+            cohort.allocation.namespace == namespace && index < cohort.bindings.len(),
+            "foreign original Pod scope"
+        );
+        let name = &cohort.allocation.nodes[index].pod_name;
+        let pod: k8s_openapi::api::core::v1::Pod = serde_json::from_str(
+            &self.kubectl(&["-n", namespace, "get", "pod", name, "-o", "json"])?,
+        )?;
+        ensure!(
+            pod.uid().as_deref() == Some(&cohort.bindings[index].pod_uid)
+                && pod.metadata.deletion_timestamp.is_none()
+                && pod
+                    .owner_references()
+                    .iter()
+                    .any(|owner| owner.controller == Some(true)
+                        && owner.uid == cohort.allocation.resource_uid)
+                && pod.labels().get(kuberic_operator::resources::POD_UID)
+                    == Some(&cohort.bindings[index].pod_uid)
+                && pod.status.as_ref().is_some_and(|status| status
+                    .container_statuses
+                    .as_ref()
+                    .is_some_and(|containers| containers.len() == 1
+                        && containers[0].restart_count == 0
+                        && containers[0]
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.running.is_some()))),
+            "fault target is not the running original primary Pod"
+        );
+        Ok(())
+    }
+
+    fn verify_restoration(&self, namespace: &str, event: &Value, fault: &Value) -> Result<()> {
+        ensure!(
+            event["cohort"] == fault["cohort"],
+            "restoration changed original cohort"
+        );
+        let cohort: kuberic_operator::FrozenCohort =
+            serde_json::from_value(event["cohort"].clone())?;
+        cohort.fm_config()?;
+        let victim = usize::try_from(event["victim"].as_u64().context("repair victim")?)?;
+        ensure!(
+            victim < cohort.bindings.len()
+                && fault["report"]["node_index"].as_u64() == Some(u64::try_from(victim)?),
+            "repair changed original fault scope"
+        );
+        for (index, node) in cohort.allocation.nodes.iter().enumerate() {
+            self.original_pod(namespace, &cohort, index)?;
+            let status: Value = serde_json::from_str(&self.kubectl(&[
+                "-n",
+                namespace,
+                "exec",
+                &node.pod_name,
+                "-c",
+                "node",
+                "--",
+                "/opt/fube/kuberic-kind",
+                "inspect-node",
+                "--cohort",
+                &serde_json::to_string(&cohort)?,
+                "--node-index",
+                &index.to_string(),
+            ])?)?;
+            ensure!(
+                status["control_unknown"] == false
+                    && status["fm_connected"] == true
+                    && status["peers_connected"] == 2
+                    && status["replica_phase"] == "Ready"
+                    && status["local_configuration_complete"] == true
+                    && status["configuration_members"] == 3,
+                "native original membership was not restored: {status}"
+            );
+            if index == victim {
+                let old = &fault["report"];
+                ensure!(
+                    status["replica_id"].as_i64().context("restored replica")?
+                        > old["replica_id"].as_i64().context("predecessor replica")?
+                        && status["replica_instance"]
+                            .as_i64()
+                            .context("restored instance")?
+                            > old["replica_instance"]
+                                .as_i64()
+                                .context("predecessor instance")?
+                        && status["application_pid"] != old["application_pid"]
+                        && status["retired_applications"]
+                            .as_array()
+                            .context("retired original applications")?
+                            .iter()
+                            .any(|retired| retired["pid"] == old["application_pid"]
+                                && retired["reaped"] == true
+                                && retired["group_drained"] == true
+                                && retired["root_removed"] == true
+                                && retired["forced"] == false),
+                    "fresh replica lacks positive original-host cleanup: {status}"
+                );
+            }
+        }
+        self.apply(&json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {
+            "namespace": namespace, "name": format!("host-restored-{}", event["cycle"].as_u64().context("repair cycle")?)
+        }, "data": {"setUid": cohort.allocation.resource_uid}}))
     }
 }
 

@@ -161,6 +161,7 @@ pub enum ControllerPhase {
     Configuring,
     Starting,
     Reconfiguring,
+    Restoring,
     Serving,
     Stopping,
     Stopped,

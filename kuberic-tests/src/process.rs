@@ -218,10 +218,12 @@ pub async fn wait_replicated(endpoint: &str) {
     loop {
         let state: Value = serde_json::from_str(&application(endpoint, "state").await).unwrap();
         let peers = state["peers"].as_array().unwrap();
+        let last = state["provider"]["last"].as_i64().unwrap();
         if peers.len() == 2
+            && last >= 1
             && peers
                 .iter()
-                .all(|peer| peer["applied"].as_i64().unwrap() >= 1)
+                .all(|peer| peer["applied"].as_i64().unwrap() >= last)
         {
             return;
         }

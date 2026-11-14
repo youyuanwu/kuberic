@@ -147,8 +147,19 @@ impl ScriptedFm {
             .iter()
             .position(|node| node.identity.id == primary)
             .unwrap();
-        let report =
+        let mut report =
             crate::fm::app_host_loss(&config, &session.configured.as_ref().unwrap().unit, node);
+        let replica = session
+            .configured
+            .as_ref()
+            .unwrap()
+            .replicas
+            .0
+            .iter()
+            .find(|replica| replica.node == config.nodes[node].identity.native().unwrap())
+            .unwrap();
+        report.dropped.0[0].replicas.0[0].description.id = replica.id;
+        report.dropped.0[0].replicas.0[0].description.instance = replica.instance;
         session
             .state
             .observe(node, &replica_up_message(&report, Owner::Fm).unwrap())
@@ -164,6 +175,13 @@ impl ScriptedFm {
             .state
             .disconnected(node)
             .unwrap();
+    }
+
+    pub async fn restore(&self) {
+        for _ in 0..3 {
+            let command = self.command().await;
+            self.complete(&command).await;
+        }
     }
 
     pub async fn create(&self) {

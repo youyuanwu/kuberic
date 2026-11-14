@@ -20,10 +20,15 @@ use crate::Scenario;
 
 const BUDGET: Duration = Duration::from_secs(180);
 
-pub fn crash_primary_app(cohort: &FrozenCohort) -> Result<()> {
-    let config = resources::runner_config(cohort, 1)?;
+pub fn inspect_node(cohort: &FrozenCohort, node_index: usize) -> Result<serde_json::Value> {
+    cohort.fm_config()?;
     ensure!(
-        std::env::var("POD_UID")? == cohort.bindings[1].pod_uid
+        node_index < cohort.bindings.len(),
+        "invalid original node index"
+    );
+    let config = resources::runner_config(cohort, node_index)?;
+    ensure!(
+        std::env::var("POD_UID")? == cohort.bindings[node_index].pod_uid
             && std::env::var("KUBERIC_SET_UID")? == cohort.allocation.resource_uid,
         "fault injection does not own this original primary Pod"
     );
@@ -38,10 +43,19 @@ pub fn crash_primary_app(cohort: &FrozenCohort) -> Result<()> {
     ensure!(
         status["deployment"] == config.deployment
             && status["node"]["id"] == config.node.identity.id
-            && status["stage"] == "running"
-            && status["replica_role"] == 4,
+            && status["stage"] == "running",
         "original node is not running: {status}"
     );
+    Ok(status)
+}
+
+pub fn crash_primary_app(cohort: &FrozenCohort, node_index: usize) -> Result<()> {
+    let status = inspect_node(cohort, node_index)?;
+    ensure!(
+        status["replica_role"] == 4,
+        "fault target is not the current primary"
+    );
+    let config = resources::runner_config(cohort, node_index)?;
     let pid = status["application_pid"]
         .as_u64()
         .context("original application PID")?;
@@ -65,7 +79,9 @@ pub fn crash_primary_app(cohort: &FrozenCohort) -> Result<()> {
         "{}",
         serde_json::json!({
             "event": "primary_app_crashed", "set_uid": cohort.allocation.resource_uid,
-            "pod_uid": cohort.bindings[1].pod_uid, "application_pid": pid
+            "pod_uid": cohort.bindings[node_index].pod_uid, "application_pid": pid,
+            "node_index": node_index, "replica_id": status["replica_id"],
+            "replica_instance": status["replica_instance"]
         })
     );
     Ok(())

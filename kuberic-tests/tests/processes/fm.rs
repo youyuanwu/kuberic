@@ -39,10 +39,45 @@ async fn lifecycle(failover: bool) {
         assert!(application(next, "read")
             .await
             .contains("value=acknowledged"));
-        assert!(application(next, "write-more").await.starts_with("OK"));
+        let written = application(next, "write-more").await;
+        assert!(
+            written.starts_with("OK"),
+            "{written}; {}",
+            cluster.diagnostics()
+        );
         assert!(application(next, "read").await.contains("value=continued"));
         assert_application_stopped(lost);
         assert!(tokio::net::TcpStream::connect(endpoint).await.is_err());
+        let restored: Value = serde_json::from_slice(
+            &fs::read(cluster.configs[1].run_directory.join("status.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(restored["replica_id"].as_i64().unwrap() > cluster.configs[1].node.replica_id);
+        assert!(
+            restored["replica_instance"].as_i64().unwrap()
+                > cluster.configs[1].node.replica_instance
+        );
+        assert_eq!(restored["retired_applications"][0]["pid"], lost);
+        assert_eq!(restored["retired_applications"][0]["reaped"], true);
+        assert_eq!(restored["retired_applications"][0]["group_drained"], true);
+        assert_eq!(restored["retired_applications"][0]["root_removed"], true);
+        wait_replicated(next).await;
+        let second_lost = crash_application(&cluster.configs[0]);
+        let again = cluster
+            .until_status("second restored failover", |status| {
+                status["phase"] == "serving" && status["primary_node_id"] == "2"
+            })
+            .await;
+        let next = again["service_endpoint"].as_str().unwrap();
+        assert!(application(next, "read").await.contains("value=continued"));
+        let written = application(next, "write-final").await;
+        assert!(
+            written.starts_with("OK"),
+            "{written}; {}",
+            cluster.diagnostics()
+        );
+        assert!(application(next, "read").await.contains("value=final"));
+        assert_application_stopped(second_lost);
     }
 
     terminate(&cluster.fm);
