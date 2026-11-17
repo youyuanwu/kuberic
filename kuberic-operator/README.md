@@ -119,7 +119,7 @@ Primary. During `reconfiguring`, the operator withdraws Service routing; on
 completion it selects the new Primary's exact original Pod UID and records
 `status.primaryNodeId`. It never rewrites the frozen allocation or restarts Pods.
 
-This is unplanned application-process failover, not graceful switchover or
+This is unplanned application-process failover, not the planned handoff below or
 Node/Pod/network-partition recovery. Further loss in the reduced cohort remains
 blocked until native restoration finishes. The failed application can remain an
 owned zombie until original-host retirement;
@@ -165,7 +165,9 @@ Mock-backed runtime tests cover independent original owners, reserved
 listeners, stale parent UIDs, restart refusal and cleanup evidence. Real
 KinD bootstrap, early-deletion, application-crash failover and Secondary repair
 journeys run against the deployed operator;
-their driver has only read access to workload resources. The separate
+their driver has only read access to workload resources. The switchover
+journey additionally grants patch access to `kubericsets/status` to submit the
+same target-Primary request as an administrator. The separate
 staggered-shutdown qualification retains explicit deterministic reconciliation
 scheduling. See the live inventory with `cargo test --workspace -- --list`.
 
@@ -176,3 +178,51 @@ publication without claiming remote writer fencing or successful native
 deletion. Physical cleanup of these failed fixtures is verified separately.
 KinD additionally holds actual fresh-host copy and verifies non-voting Idle
 state and unchanged Primary routing before releasing normal repair.
+
+## Planned switchover
+
+The API follows CNPG's target/current status pattern rather than adding a spec
+request or annotation. In stable Serving membership, `status.primaryNodeId`
+and `status.targetPrimaryNodeId` identify the admitted Primary. Read the
+KubericSet and choose another node ID from `status.allocation.nodes`:
+
+```sh
+kubectl --context CONTEXT -n NAMESPACE get kubericset NAME -o json
+kubectl --context CONTEXT -n NAMESPACE patch kubericset NAME \
+  --subresource=status --type=merge \
+  -p '{"metadata":{"uid":"CURRENT_UID","resourceVersion":"CURRENT_RESOURCE_VERSION"},"status":{"targetPrimaryNodeId":"TARGET_NODE_ID"}}'
+```
+
+Use the UID/resourceVersion from that observation; on conflict, reobserve and
+revalidate the intended target. The caller needs patch access to the
+`kubericsets/status` subresource. A target already equal to the current Primary
+does not start a handoff. Do not edit the allocation, bindings, completion
+receipt or current Primary fields.
+
+The operator first disables the client Service and clears endpoint publication,
+then asks its original FM to retain the handoff. It reports `switching` with
+the last native-completed `primaryNodeId`. Native phase-0 demotion revokes the
+old writer; routing withdrawal alone is not writer fencing. Fube owns peer
+continuation, actual progress/quorum/history selection, catch-up and every
+Secondary activation. Only the exact successful final native completion from
+the target authorizes changed Primary routing and `status.switchover.completed`.
+Endpoints may change only as required by the new roles; replica and original
+Node/Pod/application identities remain unchanged. Exact retries reuse the
+accepted operation and do not reset its timeout.
+
+Only one healthy handoff from initial 3/2 admission is qualified. Transfer after
+repair, reverse/repeated transfer, cancellation/retargeting after acceptance,
+and application loss during or after handoff are explicitly blocked. Native
+cases requiring Secondary restart/rebuild cannot complete this path. There is
+no automatic abort, failback, restart recovery or generation-change overlap.
+Deletion during an accepted handoff waits for native completion with routing
+disabled, then performs normal final-membership deletion and positive cleanup.
+Recreating a controller facade over the same live backend can continue; status
+cannot admit a new FM/operator owner.
+
+Scripted tests cover exact retries, early endpoint reports, invalid/missing
+completions, stale status/effects, refusal and deletion during handoff.
+Real-process qualification exercises either Secondary candidate, preserved
+data, old-writer rejection, continued writes and unchanged host/replica
+identities. KinD qualifies the target-status request, deployed Service routing,
+old-writer rejection, original Pod lifetimes and finalizer cleanup.

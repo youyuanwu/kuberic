@@ -45,6 +45,10 @@ pub enum Plan {
     },
     AdvanceTeardown(TeardownStage),
     ShutdownFm(FrozenCohort),
+    Switchover {
+        cohort: FrozenCohort,
+        target_node_id: String,
+    },
     JoinFm(FrozenCohort),
     DeletePod(usize),
     DeleteConfigMap(usize),
@@ -554,6 +558,61 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         );
         return Ok(Plan::ConfigureNode(index));
     }
+    if let Some(swap) = &report.status.switchover {
+        ensure!(
+            status.target_primary_node_id.as_ref() == Some(&swap.target_node_id),
+            "accepted switchover cannot be cancelled, retargeted or repeated"
+        );
+        if let Some(accepted) = &status.switchover {
+            ensure!(
+                accepted.source_node_id == swap.source_node_id
+                    && accepted.target_node_id == swap.target_node_id
+                    && (!accepted.completed || swap.completed),
+                "switchover status differs from original native authority"
+            );
+        }
+    } else if let Some(target) = status.target_primary_node_id.as_ref().filter(|target| {
+        Some(*target) != status.primary_node_id.as_ref()
+            && *target != &report.status.primary_node_id
+    }) {
+        ensure!(
+            report.status.phase == Phase::Serving
+                && cohort
+                    .allocation
+                    .nodes
+                    .iter()
+                    .any(|node| &node.node_id == target),
+            "switchover requires Serving membership and an original Secondary target"
+        );
+        let disabled = resources::disabled_selector(set)?;
+        if observation
+            .service
+            .as_ref()
+            .and_then(|service| service.spec.as_ref())
+            .and_then(|spec| spec.selector.as_ref())
+            != Some(&disabled)
+        {
+            return Ok(Plan::Route(disabled));
+        }
+        if status.phase != ControllerPhase::Switching || status.service_endpoint.is_some() {
+            let mut next = status.clone();
+            next.phase = ControllerPhase::Switching;
+            next.service_endpoint = None;
+            return Ok(Plan::Status(Box::new(next)));
+        }
+        ensure!(
+            !deleting,
+            "unaccepted switchover cannot start during deletion"
+        );
+        return Ok(Plan::Switchover {
+            cohort,
+            target_node_id: target.clone(),
+        });
+    }
+    ensure!(
+        report.status.switchover.is_some() || status.switchover.is_none(),
+        "switchover status has no original native owner"
+    );
     let serving = matches!(report.status.phase, Phase::Serving | Phase::Restoring);
     ensure!(
         !serving
@@ -592,6 +651,7 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         match report.status.phase {
             Phase::Serving => ControllerPhase::Serving,
             Phase::Reconfiguring => ControllerPhase::Reconfiguring,
+            Phase::Switching => ControllerPhase::Switching,
             Phase::Restoring => ControllerPhase::Restoring,
             Phase::Deleting | Phase::AwaitingNodeShutdown => ControllerPhase::Stopping,
             Phase::Stopped => ControllerPhase::Stopped,
@@ -599,7 +659,20 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         }
     };
     next.service_endpoint = report.status.service_endpoint.clone().filter(|_| publish);
-    next.primary_node_id = publish.then(|| report.status.primary_node_id.clone());
+    next.primary_node_id = (publish || report.status.phase == Phase::Switching)
+        .then(|| report.status.primary_node_id.clone());
+    next.switchover = report
+        .status
+        .switchover
+        .as_ref()
+        .map(|swap| crate::crd::SwitchoverStatus {
+            source_node_id: swap.source_node_id.clone(),
+            target_node_id: swap.target_node_id.clone(),
+            completed: swap.completed,
+        });
+    if report.status.switchover.is_none() {
+        next.target_primary_node_id = publish.then(|| report.status.primary_node_id.clone());
+    }
     next.reason = None;
     if &next != status {
         return Ok(Plan::Status(Box::new(next)));

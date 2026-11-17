@@ -4,6 +4,15 @@ use kuberic_kind_tests::{host::Cluster, Scenario};
 
 #[test]
 #[ignore = "requires an explicitly owned KinD cluster; run just kind-test"]
+fn planned_switchover_preserves_data_fences_old_writer_and_updates_deployed_routing() {
+    Cluster::from_env()
+        .unwrap()
+        .scenario(Scenario::Switchover)
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires an explicitly owned KinD cluster; run just kind-test"]
 fn bootstrap_quorum_write_read_and_owned_teardown() {
     Cluster::from_env()
         .unwrap()

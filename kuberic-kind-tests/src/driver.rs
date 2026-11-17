@@ -470,10 +470,12 @@ fn retry_observation(error: &anyhow::Error) -> bool {
 pub(crate) async fn wait_for_service(endpoint: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(endpoint)).await {
-            Ok(Ok(_)) => return Ok(()),
+        match application(endpoint, "read").await {
+            Ok(reply) if reply.starts_with("OK role=Primary ") => return Ok(()),
             result if Instant::now() >= deadline => {
-                anyhow::bail!("primary Service did not become reachable: {endpoint}: {result:?}")
+                anyhow::bail!(
+                    "primary Service did not serve a Primary read: {endpoint}: {result:?}"
+                )
             }
             result => eprintln!("Waiting for primary Service dataplane: {result:?}"),
         }

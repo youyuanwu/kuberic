@@ -496,6 +496,19 @@ impl Cluster {
                 "copy barrier was not verified before native restoration"
             );
         }
+        if scenario == Scenario::Switchover {
+            ensure!(
+                events
+                    .iter()
+                    .any(|event| event["event"] == "switchover_complete"
+                        && event["set_uid"] == completed["set_uid"]
+                        && event["cohort"] == completed["cohort"]
+                        && event["data_preserved"] == true
+                        && event["old_writer_revoked"] == true
+                        && event["original_nodes_unchanged"] == true),
+                "successful driver omitted native switchover evidence"
+            );
+        }
         ensure!(
             scenario == Scenario::DeleteDuringBootstrap
                 || events
@@ -524,13 +537,14 @@ impl Cluster {
                 .map(serde_json::from_str)
                 .collect::<std::result::Result<_, _>>()?;
             verify_operator_cleanup(completed, &operator_events)?;
-            if application_fault {
+            if application_fault || scenario == Scenario::Switchover {
                 let promoted = events
                     .iter()
                     .rev()
                     .find(|event| {
                         event["event"] == "primary_app_failover"
                             || event["event"] == "secondary_app_repair"
+                            || event["event"] == "switchover_complete"
                     })
                     .context("missing repaired primary")?;
                 ensure!(
@@ -932,9 +946,10 @@ fn scenario_resources(
         Scenario::PrimaryAppFailover => vec!["run", "--primary-app-failover"],
         Scenario::SecondaryAppRepair => vec!["run", "--secondary-app-repair"],
         Scenario::CopyHeldSecondaryRepair => vec!["run", "--secondary-app-repair", "--hold-copy"],
+        Scenario::Switchover => vec!["run", "--switchover"],
     };
     let scripted = scenario == Scenario::StaggeredShutdown;
-    let rules = if scripted {
+    let mut rules = if scripted {
         json!([
             {"apiGroups": ["operator.kuberic.io"], "resources": ["kubericsets", "kubericsets/status", "kubericsets/finalizers"],
              "verbs": ["get", "list", "create", "update", "patch", "delete"]},
@@ -949,6 +964,15 @@ fn scenario_resources(
              "verbs": ["get", "list"]}
         ])
     };
+    if scenario == Scenario::Switchover {
+        rules
+            .as_array_mut()
+            .context("driver RBAC rules")?
+            .push(json!({
+                "apiGroups": ["operator.kuberic.io"], "resources": ["kubericsets/status"],
+                "verbs": ["patch"]
+            }));
+    }
     let mut resources = json!({"apiVersion": "v1", "kind": "List", "items": [
         {"apiVersion": "v1", "kind": "Namespace", "metadata": {
             "name": namespace, "labels": {"testing.kuberic.io/kind-owned": cluster}}},

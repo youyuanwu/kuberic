@@ -37,11 +37,19 @@ async fn real_secondary_app_crashes_preserve_controller_primary_routing_and_orig
     lifecycle(false, Fault::Secondary).await;
 }
 
+#[tokio::test]
+async fn real_planned_switchover_fences_old_writer_preserves_data_and_routes_either_secondary() {
+    for candidate in [0, 2] {
+        lifecycle(false, Fault::Switchover(candidate)).await;
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
     None,
     Primary,
     Secondary,
+    Switchover(usize),
 }
 
 async fn lifecycle(delete_during_bootstrap: bool, fault: Fault) {
@@ -122,7 +130,129 @@ async fn lifecycle(delete_during_bootstrap: bool, fault: Fault) {
             selector.get(resources::POD_UID),
             Some(&cohort.bindings[1].pod_uid)
         );
-        if fault != Fault::None {
+        if let Fault::Switchover(candidate) = fault {
+            let endpoint = endpoint.clone();
+            wait_replicated(&endpoint).await;
+            let owners: Vec<Value> = cohort
+                .bindings
+                .iter()
+                .map(|binding| {
+                    serde_json::from_slice(
+                        &fs::read(
+                            supervisor.configs[&binding.pod_uid]
+                                .run_directory
+                                .join("status.json"),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let mut requested = started.clone();
+            requested.status.as_mut().unwrap().target_primary_node_id =
+                Some(cohort.allocation.nodes[candidate].node_id.clone());
+            sets.replace_status(NAME, &PostParams::default(), &requested)
+                .await
+                .unwrap();
+            let deadline = Instant::now() + operation_budget;
+            started = loop {
+                let outcome = reconcile(&controller, NAME).await.unwrap();
+                assert!(
+                    outcome.blocked.is_none(),
+                    "{outcome:?}; FM={:?}; nodes={}",
+                    fm.observe().await.unwrap(),
+                    supervisor.diagnostics()
+                );
+                supervisor.tick(&set.uid().unwrap()).await;
+                let current = sets.get(NAME).await.unwrap();
+                let status = current.status.as_ref().unwrap();
+                assert_eq!(status.cohort().as_ref(), Some(&cohort));
+                if status.phase == ControllerPhase::Switching {
+                    assert!(status.service_endpoint.is_none());
+                    let selector = services
+                        .get(&resources::write_service_name(NAME))
+                        .await
+                        .unwrap()
+                        .spec
+                        .unwrap()
+                        .selector;
+                    if selector != Some(resources::disabled_selector(&current).unwrap()) {
+                        let native = fm.observe().await.unwrap().unwrap().status;
+                        assert!(native
+                            .switchover
+                            .as_ref()
+                            .is_some_and(|swap| swap.completed));
+                        assert_eq!(
+                            native.primary_node_id,
+                            cohort.allocation.nodes[candidate].node_id
+                        );
+                        assert_eq!(
+                            selector.as_ref().unwrap().get(resources::POD_UID),
+                            Some(&cohort.bindings[candidate].pod_uid)
+                        );
+                    }
+                }
+                if status.phase == ControllerPhase::Serving
+                    && status.primary_node_id.as_ref()
+                        == Some(&cohort.allocation.nodes[candidate].node_id)
+                    && status
+                        .switchover
+                        .as_ref()
+                        .is_some_and(|swap| swap.completed)
+                {
+                    let next = status.service_endpoint.as_ref().unwrap();
+                    assert_ne!(next, &endpoint);
+                    assert!(application(&endpoint, "write-final")
+                        .await
+                        .contains("NotPrimary"));
+                    assert!(application(next, "read")
+                        .await
+                        .contains("value=acknowledged"));
+                    assert!(application(next, "write-more").await.starts_with("OK"));
+                    assert!(application(next, "read").await.contains("value=continued"));
+                    let selector = services
+                        .get(&resources::write_service_name(NAME))
+                        .await
+                        .unwrap()
+                        .spec
+                        .unwrap()
+                        .selector
+                        .unwrap();
+                    assert_eq!(
+                        selector.get(resources::POD_UID),
+                        Some(&cohort.bindings[candidate].pod_uid)
+                    );
+                    for (binding, owner) in cohort.bindings.iter().zip(&owners) {
+                        let native: Value = serde_json::from_slice(
+                            &fs::read(
+                                supervisor.configs[&binding.pod_uid]
+                                    .run_directory
+                                    .join("status.json"),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        for field in [
+                            "application_pid",
+                            "runtime_root",
+                            "replica_id",
+                            "replica_instance",
+                            "host_replacement_count",
+                        ] {
+                            assert_eq!(native[field], owner[field], "{field}: {native}");
+                        }
+                    }
+                    break current;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "switchover deadline: {current:?}; FM={:?}; nodes={}",
+                    fm.observe().await.unwrap(),
+                    supervisor.diagnostics()
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+        } else if fault != Fault::None {
             let cycles = if fault == Fault::Primary {
                 [(1, 0), (0, 1)]
             } else {

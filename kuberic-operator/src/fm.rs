@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use kuberic_fm::{Phase, State, Status};
 use tokio::{
     net::TcpListener,
-    sync::{oneshot, watch, Mutex},
+    sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
 };
 
@@ -40,6 +40,7 @@ pub trait FmApi: Send + Sync {
     async fn allocation(&self) -> Result<Option<Allocation>>;
     async fn observe(&self) -> Result<Option<FmObservation>>;
     async fn start(&self, cohort: &FrozenCohort) -> Result<()>;
+    async fn switchover(&self, cohort: &FrozenCohort, target_node_id: &str) -> Result<()>;
     async fn shutdown(&self, cohort: &FrozenCohort) -> Result<()>;
     async fn join(&self, cohort: &FrozenCohort) -> Result<()>;
     async fn invalidate(&self, cohort: &FrozenCohort, reason: &str) -> Result<()>;
@@ -51,6 +52,7 @@ struct Session {
     task: Option<JoinHandle<Result<()>>>,
     shutdown: Option<oneshot::Sender<()>>,
     invalidation: Option<oneshot::Sender<String>>,
+    switchover: mpsc::Sender<kuberic_fm::SwitchoverRequest>,
     failure: Option<String>,
 }
 
@@ -177,6 +179,35 @@ impl FmApi for ProcessFm {
         ProcessFm::shutdown(self, cohort).await
     }
 
+    async fn switchover(&self, cohort: &FrozenCohort, target_node_id: &str) -> Result<()> {
+        let requests = {
+            let session = self.session.lock().await;
+            let session = session.as_ref().context("FM has not started")?;
+            ensure!(
+                session.cohort == *cohort
+                    && session.failure.is_none()
+                    && session.shutdown.is_some()
+                    && session
+                        .task
+                        .as_ref()
+                        .is_some_and(|task| !task.is_finished()),
+                "switchover requires the live original FM owner"
+            );
+            session.switchover.clone()
+        };
+        let (accepted, result) = oneshot::channel();
+        requests
+            .send(kuberic_fm::SwitchoverRequest {
+                target_node_id: target_node_id.into(),
+                accepted,
+            })
+            .await
+            .context("native switchover receiver closed")?;
+        result
+            .await
+            .context("native switchover acceptance owner closed")?
+    }
+
     async fn join(&self, cohort: &FrozenCohort) -> Result<()> {
         {
             let session = self.session.lock().await;
@@ -230,6 +261,7 @@ impl FmApi for ProcessFm {
         let (status, observed) = watch::channel(State::new(config.clone())?.status());
         let (shutdown, stopped) = oneshot::channel();
         let (invalidation, invalidated) = oneshot::channel();
+        let (switchover, requests) = mpsc::channel(1);
         let task = tokio::spawn(kuberic_fm::run_guarded(
             config,
             listener,
@@ -243,6 +275,7 @@ impl FmApi for ProcessFm {
                     Err(_) => "live FM owner dropped".into(),
                 }
             },
+            requests,
             move |value| {
                 status.send_replace(value.clone());
                 Ok(())
@@ -254,6 +287,7 @@ impl FmApi for ProcessFm {
             task: Some(task),
             shutdown: Some(shutdown),
             invalidation: Some(invalidation),
+            switchover,
             failure: None,
         });
         Ok(())

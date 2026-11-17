@@ -25,7 +25,9 @@ API, local processes and an isolated KinD cluster. The operator provides a
 namespace-scoped watch/requeue loop, image build and installation manifests;
 it is not production-ready or restart-recoverable. The supported failover is
 an application-process crash, not Node/Pod loss or a network partition.
-There is no replica persistence/restart recovery, switchover, Node replacement, reconnect,
+One healthy planned 3/2 switchover is also supported through the original native
+owners, without rebuilding replicas or replacing Pods.
+There is no replica persistence/restart recovery, Node replacement, reconnect,
 resize or rolling upgrade. FM state is in-memory; restarting the FM does not
 recover the deployment. A lost original
 channel or invalid completion produces explicit control uncertainty and withdraws
@@ -189,6 +191,33 @@ Native grounding: Service Fabric baseline `3988b451`,
 `ra/ReconfigurationAgent.cpp::AppHostClosedProcessor`,
 `ra/FailoverUnit.cpp::CanReopenDownReplica`, and
 `fm/FailoverUnit.cpp::CreateReplica` / `fm/Replica.cpp::Reuse`.
+
+### Planned switchover
+
+Following CNPG's target/current status pattern, an administrator requests
+promotion by optimistically patching `status.targetPrimaryNodeId` to an original
+Secondary's native node ID. This is not a Pod name or replica ID. The operator
+withdraws Service routing before sending native `DoReconfiguration` to the old
+Primary. During `switching`, `primaryNodeId` retains the last native-completed
+Primary and the published endpoint is absent.
+
+Shared fube RA/RAP owns old-writer demotion, peer continuation, real GetLSN
+quorum/history selection, catch-up, Secondary activation and final completion.
+Only the selected candidate's exact successful `DoReconfigurationReply` can
+publish its endpoint and original Pod UID. Endpoint notifications are ACKed but
+never authorize publication. Original Node/application owners and replica
+identities remain unchanged. Exact requests and native retries are idempotent.
+`status.switchover` records the accepted source, target and native completion;
+like other status, it cannot recover a lost backend.
+
+The qualified scope is one healthy handoff from the initial fully admitted
+3/2 membership, followed by ordinary operation and teardown. Transfer after
+repair, reverse/repeated transfer, cancellation or retargeting after native
+acceptance, and application loss during or after handoff block explicitly.
+Cases needing native Secondary restart/rebuild also block rather than reducing
+membership or inventing progress. Deletion during an accepted handoff keeps
+routing disabled, waits for its native completion and deletes the final
+membership. See [request instructions](kuberic-operator/README.md#planned-switchover).
 
 ### Bootstrap authority
 

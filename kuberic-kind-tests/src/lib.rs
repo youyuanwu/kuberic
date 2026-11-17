@@ -14,6 +14,7 @@ pub enum Scenario {
     PrimaryAppFailover,
     SecondaryAppRepair,
     CopyHeldSecondaryRepair,
+    Switchover,
 }
 
 impl Scenario {
@@ -25,6 +26,7 @@ impl Scenario {
             Self::PrimaryAppFailover => "primary-app-failover",
             Self::SecondaryAppRepair => "secondary-app-repair",
             Self::CopyHeldSecondaryRepair => "copy-held-secondary-repair",
+            Self::Switchover => "switchover",
         }
     }
 }

@@ -29,6 +29,8 @@ enum Operation {
         secondary_app_repair: bool,
         #[arg(long, requires = "secondary_app_repair")]
         hold_copy: bool,
+        #[arg(long, conflicts_with_all = ["early_delete", "staggered_shutdown", "primary_app_failover", "secondary_app_repair", "hold_copy"])]
+        switchover: bool,
     },
     CrashPrimaryApp {
         #[arg(long)]
@@ -84,8 +86,11 @@ async fn main() -> Result<()> {
             primary_app_failover,
             secondary_app_repair,
             hold_copy,
+            switchover,
         } => {
-            let scenario = if early_delete {
+            let scenario = if switchover {
+                Scenario::Switchover
+            } else if early_delete {
                 Scenario::DeleteDuringBootstrap
             } else if staggered_shutdown {
                 Scenario::StaggeredShutdown

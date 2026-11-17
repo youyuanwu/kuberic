@@ -161,6 +161,7 @@ pub enum ControllerPhase {
     Configuring,
     Starting,
     Reconfiguring,
+    Switching,
     Restoring,
     Serving,
     Stopping,
@@ -194,6 +195,14 @@ pub struct BootstrapWait {
     pub deadline_unix_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SwitchoverStatus {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub completed: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KubericSetStatus {
@@ -203,6 +212,10 @@ pub struct KubericSetStatus {
     pub service_endpoint: Option<String>,
     #[serde(default)]
     pub primary_node_id: Option<String>,
+    #[serde(default)]
+    pub target_primary_node_id: Option<String>,
+    #[serde(default)]
+    pub switchover: Option<SwitchoverStatus>,
     pub reason: Option<String>,
     #[serde(default)]
     pub bootstrap_wait: Option<BootstrapWait>,

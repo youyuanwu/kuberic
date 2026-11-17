@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{ensure, Context, Result};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Service};
 use kube::{
-    api::{DeleteParams, ListParams, PostParams, Preconditions},
+    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions},
     Api, Client, ResourceExt,
 };
 use kuberic_operator::{resources, ControllerPhase, KubericSet};
@@ -125,6 +125,9 @@ pub async fn run(scenario: Scenario) -> Result<()> {
                 "event": "application_write_read", "write": written, "read": read
             })
         );
+        if scenario == Scenario::Switchover {
+            switchover(&sets, &services, &client, &started, &endpoint).await?;
+        }
         if matches!(
             scenario,
             Scenario::PrimaryAppFailover
@@ -386,10 +389,164 @@ async fn await_host_restoration(
             );
             return Ok(());
         }
+
         ensure!(
             Instant::now() < deadline,
             "host did not verify physical restoration"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn switchover(
+    sets: &Api<KubericSet>,
+    services: &Api<Service>,
+    client: &Client,
+    original: &KubericSet,
+    endpoint: &str,
+) -> Result<()> {
+    let name = original.name_any();
+    let uid = original.uid().context("switchover parent UID")?;
+    let before = original.status.as_ref().context("original status")?;
+    let cohort = before.cohort().context("switchover cohort")?;
+    let old_endpoint = before
+        .service_endpoint
+        .as_ref()
+        .context("old Primary endpoint")?;
+    let target = &cohort.allocation.nodes[0].node_id;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state: serde_json::Value =
+            serde_json::from_str(&application(endpoint, "state").await?)?;
+        let last = state["provider"]["last"].as_i64().context("provider LSN")?;
+        if state["peers"].as_array().is_some_and(|peers| {
+            peers.len() == 2
+                && peers
+                    .iter()
+                    .all(|peer| peer["applied"].as_i64().is_some_and(|lsn| lsn >= last))
+        }) {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "switchover peers did not catch up: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    loop {
+        let current = sets.get(&name).await?;
+        ensure!(
+            current.uid().as_deref() == Some(&uid)
+                && current
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.phase == ControllerPhase::Serving
+                        && status.primary_node_id == before.primary_node_id
+                        && status.target_primary_node_id == before.target_primary_node_id),
+            "switchover request raced changed authority: {current:?}"
+        );
+        let patch = serde_json::json!({
+            "metadata": {"uid": uid, "resourceVersion": current.resource_version()},
+            "status": {"targetPrimaryNodeId": target}
+        });
+        match sets
+            .patch_status(&name, &PatchParams::default(), &Patch::Merge(patch))
+            .await
+        {
+            Ok(_) => break,
+            Err(kube::Error::Api(error)) if error.code == 409 => {
+                ensure!(
+                    Instant::now() < deadline,
+                    "switchover request conflicts exceeded deadline"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let current = sets.get(&name).await?;
+        let status = current.status.as_ref().context("switchover status")?;
+        ensure!(
+            current.uid().as_deref() == Some(&uid)
+                && status.cohort().as_ref() == Some(&cohort)
+                && status.phase != ControllerPhase::Blocked,
+            "deployed switchover blocked or changed authority: {current:?}"
+        );
+        if status.phase == ControllerPhase::Serving
+            && status.primary_node_id.as_ref() == Some(target)
+            && status.target_primary_node_id.as_ref() == Some(target)
+            && status
+                .switchover
+                .as_ref()
+                .is_some_and(|swap| swap.completed)
+        {
+            let service = services.get(&resources::write_service_name(&name)).await?;
+            ensure!(
+                service
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.selector.as_ref())
+                    .and_then(|selector| selector.get(resources::POD_UID))
+                    == Some(&cohort.bindings[0].pod_uid),
+                "Service selected the wrong switchover Pod UID"
+            );
+            let rejected = application(old_endpoint, "write-final").await?;
+            ensure!(
+                rejected.contains("NotPrimary"),
+                "old writer remained writable: {rejected}"
+            );
+            wait_for_service(endpoint).await?;
+            let preserved = application(endpoint, "read").await?;
+            ensure!(
+                preserved.contains("value=acknowledged"),
+                "handoff lost data: {preserved}"
+            );
+            let written = application(endpoint, "write-more").await?;
+            let continued = application(endpoint, "read").await?;
+            ensure!(
+                written.starts_with("OK") && continued.contains("value=continued"),
+                "switched Service did not continue writes: {written}; {continued}"
+            );
+            let pods: Api<Pod> = Api::namespaced(client.clone(), &cohort.allocation.namespace);
+            for (node, binding) in cohort.allocation.nodes.iter().zip(&cohort.bindings) {
+                let pod = pods.get(&node.pod_name).await?;
+                ensure!(
+                    pod.uid().as_deref() == Some(&binding.pod_uid)
+                        && pod.metadata.deletion_timestamp.is_none()
+                        && pod
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.phase.as_deref() == Some("Running")
+                                && status
+                                    .container_statuses
+                                    .as_ref()
+                                    .is_some_and(|containers| !containers.is_empty()
+                                        && containers.iter().all(|container| container
+                                            .restart_count
+                                            == 0
+                                            && container
+                                                .state
+                                                .as_ref()
+                                                .is_some_and(|state| state.running.is_some())))),
+                    "switchover changed an original Pod lifetime: {pod:?}"
+                );
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "switchover_complete", "set_uid": uid, "cohort": cohort,
+                    "primary_node_id": target, "data_preserved": true,
+                    "old_writer_revoked": true, "original_nodes_unchanged": true
+                })
+            );
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "deployed switchover deadline: {current:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
