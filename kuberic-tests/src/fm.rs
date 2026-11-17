@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use fube_ra::protocol::*;
-use fube_transport::{message::Message, serialization::serde::ObjectArray};
+use fube_transport::message::Message;
+use fubst::serde::ObjectArray;
 use kuberic_fm::{Config, Fm, Identity, Placement, ServiceConfig, State};
 
 pub fn config() -> Config {

@@ -6,7 +6,7 @@ exclude = ["archive", "fube"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/youyuanwu/kuberic"
 
@@ -29,6 +29,7 @@ fube-node = { path = "fube/crates/libs/fube-node" }
 fube-node-runner = { path = "fube/crates/tools/fube-node-runner" }
 fube-ra = { path = "fube/crates/libs/fube-ra" }
 fube-transport = { path = "fube/crates/libs/fube-transport" }
+fubst = { path = "fube/crates/libs/fubst" }
 kuberic-fm = { path = "kuberic-fm" }
 kuberic-operator = { path = "kuberic-operator" }
 k8s-openapi = { version = "0.28", features = ["v1_32", "schemars"] }

@@ -19,6 +19,7 @@ fube-local-host.workspace = true
 fube-node-runner.workspace = true
 fube-ra.workspace = true
 fube-transport.workspace = true
+fubst.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 kuberic-fm.workspace = true

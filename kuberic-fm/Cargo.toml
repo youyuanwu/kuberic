@@ -15,6 +15,7 @@ fube-node.workspace = true
 fube-node-runner.workspace = true
 fube-ra.workspace = true
 fube-transport.workspace = true
+fubst.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
