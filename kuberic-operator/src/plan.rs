@@ -48,6 +48,7 @@ pub enum Plan {
     Switchover {
         cohort: FrozenCohort,
         target_node_id: String,
+        previous_configuration_epoch: i64,
     },
     JoinFm(FrozenCohort),
     DeletePod(usize),
@@ -559,24 +560,49 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         return Ok(Plan::ConfigureNode(index));
     }
     if let Some(swap) = &report.status.switchover {
-        ensure!(
-            status.target_primary_node_id.as_ref() == Some(&swap.target_node_id),
-            "accepted switchover cannot be cancelled, retargeted or repeated"
-        );
         if let Some(accepted) = &status.switchover {
+            if accepted.configuration_epoch == swap.configuration_epoch {
+                ensure!(
+                    accepted.source_node_id == swap.source_node_id
+                        && accepted.target_node_id == swap.target_node_id
+                        && accepted.previous_configuration_epoch
+                            == swap.previous_configuration_epoch
+                        && (!accepted.completed || swap.completed),
+                    "switchover status differs from original native authority"
+                );
+            } else {
+                ensure!(
+                    accepted.completed
+                        && accepted.configuration_epoch < swap.configuration_epoch
+                        && status.configuration_epoch == Some(swap.previous_configuration_epoch),
+                    "switchover status has a stale or uncompleted operation"
+                );
+            }
+        }
+        let observed_completion = status.switchover.as_ref().is_some_and(|accepted| {
+            accepted.configuration_epoch == swap.configuration_epoch && accepted.completed
+        });
+        if !swap.completed || !observed_completion {
             ensure!(
-                accepted.source_node_id == swap.source_node_id
-                    && accepted.target_node_id == swap.target_node_id
-                    && (!accepted.completed || swap.completed),
-                "switchover status differs from original native authority"
+                status.target_primary_node_id.as_ref() == Some(&swap.target_node_id),
+                "accepted switchover cannot be cancelled or retargeted before completion is observed"
             );
         }
-    } else if let Some(target) = status.target_primary_node_id.as_ref().filter(|target| {
+    }
+    if let Some(target) = status.target_primary_node_id.as_ref().filter(|target| {
         Some(*target) != status.primary_node_id.as_ref()
             && *target != &report.status.primary_node_id
+            && report.status.switchover.as_ref().is_none_or(|swap| {
+                swap.completed
+                    && status.switchover.as_ref().is_some_and(|accepted| {
+                        accepted.configuration_epoch == swap.configuration_epoch
+                            && accepted.completed
+                    })
+            })
     }) {
         ensure!(
             report.status.phase == Phase::Serving
+                && status.configuration_epoch == report.status.configuration_epoch
                 && cohort
                     .allocation
                     .nodes
@@ -607,6 +633,10 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         return Ok(Plan::Switchover {
             cohort,
             target_node_id: target.clone(),
+            previous_configuration_epoch: report
+                .status
+                .configuration_epoch
+                .context("missing completed handoff baseline")?,
         });
     }
     ensure!(
@@ -661,6 +691,7 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
     next.service_endpoint = report.status.service_endpoint.clone().filter(|_| publish);
     next.primary_node_id = (publish || report.status.phase == Phase::Switching)
         .then(|| report.status.primary_node_id.clone());
+    next.configuration_epoch = report.status.configuration_epoch;
     next.switchover = report
         .status
         .switchover
@@ -668,9 +699,11 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         .map(|swap| crate::crd::SwitchoverStatus {
             source_node_id: swap.source_node_id.clone(),
             target_node_id: swap.target_node_id.clone(),
+            previous_configuration_epoch: swap.previous_configuration_epoch,
+            configuration_epoch: swap.configuration_epoch,
             completed: swap.completed,
         });
-    if report.status.switchover.is_none() {
+    if report.status.phase != Phase::Switching {
         next.target_primary_node_id = publish.then(|| report.status.primary_node_id.clone());
     }
     next.reason = None;

@@ -189,6 +189,7 @@ pub fn runner_config(cohort: &FrozenCohort, index: usize) -> Result<fube_node_ru
             .join(&binding.pod_uid),
         startup_timeout_ms: 30_000,
         shutdown_timeout_ms: 20_000,
+        remote_replica_progress_query_wait_ms: 30_000,
     };
     config.validate().map_err(anyhow::Error::msg)?;
     Ok(config)

@@ -200,6 +200,8 @@ pub struct BootstrapWait {
 pub struct SwitchoverStatus {
     pub source_node_id: String,
     pub target_node_id: String,
+    pub previous_configuration_epoch: i64,
+    pub configuration_epoch: i64,
     pub completed: bool,
 }
 
@@ -212,6 +214,8 @@ pub struct KubericSetStatus {
     pub service_endpoint: Option<String>,
     #[serde(default)]
     pub primary_node_id: Option<String>,
+    #[serde(default)]
+    pub configuration_epoch: Option<i64>,
     #[serde(default)]
     pub target_primary_node_id: Option<String>,
     #[serde(default)]

@@ -397,8 +397,13 @@ impl Reconciler {
             Plan::Switchover {
                 cohort,
                 target_node_id,
+                previous_configuration_epoch,
             } => {
-                if let Err(error) = self.fm.switchover(&cohort, &target_node_id).await {
+                if let Err(error) = self
+                    .fm
+                    .switchover(&cohort, &target_node_id, previous_configuration_epoch)
+                    .await
+                {
                     return self
                         .block(&current, format!("native switchover refused: {error:#}"))
                         .await;

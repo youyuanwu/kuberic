@@ -4,7 +4,7 @@ use kuberic_kind_tests::{host::Cluster, Scenario};
 
 #[test]
 #[ignore = "requires an explicitly owned KinD cluster; run just kind-test"]
-fn planned_switchover_preserves_data_fences_old_writer_and_updates_deployed_routing() {
+fn repeated_switchover_composes_with_post_handoff_crash_repair_and_deployed_routing() {
     Cluster::from_env()
         .unwrap()
         .scenario(Scenario::Switchover)

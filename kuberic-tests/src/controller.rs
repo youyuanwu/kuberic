@@ -262,13 +262,18 @@ impl FmApi for ScriptedFm {
         }
         Ok(())
     }
-    async fn switchover(&self, cohort: &FrozenCohort, target_node_id: &str) -> Result<()> {
+    async fn switchover(
+        &self,
+        cohort: &FrozenCohort,
+        target_node_id: &str,
+        previous_configuration_epoch: i64,
+    ) -> Result<()> {
         let mut session = self.session.lock().await;
         let session = session.as_mut().context("missing scripted FM")?;
         ensure!(session.cohort == *cohort, "different scripted switchover");
         session
             .state
-            .request_switchover(target_node_id, session.now)
+            .request_switchover(target_node_id, previous_configuration_epoch, session.now)
     }
     async fn join(&self, cohort: &FrozenCohort) -> Result<()> {
         let mut session = self.session.lock().await;

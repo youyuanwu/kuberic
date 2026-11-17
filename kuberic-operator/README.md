@@ -198,6 +198,10 @@ revalidate the intended target. The caller needs patch access to the
 `kubericsets/status` subresource. A target already equal to the current Primary
 does not start a handoff. Do not edit the allocation, bindings, completion
 receipt or current Primary fields.
+Wait for `serving`, matching target/current Primary and an observed completed
+receipt before submitting another target. `configurationEpoch` is the latest
+native-completed membership; the receipt's `previousConfigurationEpoch` and
+`configurationEpoch` identify the accepted handoff, not restart authority.
 
 The operator first disables the client Service and clears endpoint publication,
 then asks its original FM to retain the handoff. It reports `switching` with
@@ -210,10 +214,22 @@ Endpoints may change only as required by the new roles; replica and original
 Node/Pod/application identities remain unchanged. Exact retries reuse the
 accepted operation and do not reset its timeout.
 
-Only one healthy handoff from initial 3/2 admission is qualified. Transfer after
-repair, reverse/repeated transfer, cancellation/retargeting after acceptance,
-and application loss during or after handoff are explicitly blocked. Native
-cases requiring Secondary restart/rebuild cannot complete this path. There is
+Healthy handoffs can repeat/reverse from completed 3/2 membership, including
+after Primary or Secondary application-crash repair. Each new intent freezes
+the current completed epoch and replica incarnations. Exact command replay is
+keyed to that baseline, not just the target node; stale commands cannot transfer
+newer membership. A new accepted receipt replaces the prior completed one.
+
+Application loss after completed handoff uses normal native failover or
+same-Primary Secondary removal, then fresh copy/build and 3/2 readmission on the
+same original Pod. The latest handoff receipt remains historical while passive
+target/current fields follow the admitted Primary; it cannot cause automatic
+failback. All original Node/RA/Pod owners and surviving applications are retained.
+
+Application loss during handoff/repair and cancellation/retargeting before
+accepted completion is observed remain blocked. Handoff completion with
+down/dropped members is not admitted by Kuberic; there is no spare-node policy.
+There is
 no automatic abort, failback, restart recovery or generation-change overlap.
 Deletion during an accepted handoff waits for native completion with routing
 disabled, then performs normal final-membership deletion and positive cleanup.
@@ -222,7 +238,9 @@ cannot admit a new FM/operator owner.
 
 Scripted tests cover exact retries, early endpoint reports, invalid/missing
 completions, stale status/effects, refusal and deletion during handoff.
-Real-process qualification exercises either Secondary candidate, preserved
-data, old-writer rejection, continued writes and unchanged host/replica
-identities. KinD qualifies the target-status request, deployed Service routing,
-old-writer rejection, original Pod lifetimes and finalizer cleanup.
+Real-process qualification exercises either Secondary candidate, each lost
+application role after completed handoff, positive predecessor cleanup, fresh
+repair and successive transfers using current identities. KinD composes
+reverse/repeated target-status requests with post-handoff Primary and Secondary
+crash repair, deployed routing, old-writer rejection, original Pod lifetimes and
+finalizer cleanup.
