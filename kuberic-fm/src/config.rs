@@ -6,7 +6,7 @@ use fube_ra::protocol::{
     ApplicationId, GenerationHeader, GenerationNumber, PackageId, PartitionId, Service,
     ServiceType, VersionInstance,
 };
-use fube_transport::serialization::serde::Guid;
+use fubst::serde::Guid;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

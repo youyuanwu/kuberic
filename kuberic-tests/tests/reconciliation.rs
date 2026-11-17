@@ -3,7 +3,7 @@ use kuberic_tests::fm as support;
 use std::time::Duration;
 
 use fube_ra::protocol::*;
-use fube_transport::serialization::serde::ObjectArray;
+use fubst::serde::ObjectArray;
 use kuberic_fm::{Phase, State};
 
 use support::*;

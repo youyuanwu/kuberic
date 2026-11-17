@@ -3,7 +3,8 @@ use std::{collections::VecDeque, time::Duration};
 use anyhow::{bail, ensure, Context, Result};
 use fube_node::control::wire;
 use fube_ra::protocol::*;
-use fube_transport::{message::Message, serialization::serde::ObjectArray};
+use fube_transport::message::Message;
+use fubst::serde::ObjectArray;
 use serde::Serialize;
 
 use crate::Config;
