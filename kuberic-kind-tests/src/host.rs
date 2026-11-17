@@ -338,6 +338,7 @@ impl Cluster {
             Scenario::PrimaryAppFailover
                 | Scenario::SecondaryAppRepair
                 | Scenario::CopyHeldSecondaryRepair
+                | Scenario::Switchover
         );
         let deadline = Instant::now() + Duration::from_secs(600);
         let mut original_operator = None;
@@ -498,6 +499,18 @@ impl Cluster {
         }
         if scenario == Scenario::Switchover {
             ensure!(
+                ["primary_app_failover", "secondary_app_repair"]
+                    .iter()
+                    .all(|kind| {
+                        events.iter().any(|event| {
+                            event["event"] == *kind
+                                && event["set_uid"] == completed["set_uid"]
+                                && event["cohort"] == completed["cohort"]
+                        })
+                    }),
+                "switchover composition omitted post-handoff Primary or Secondary recovery"
+            );
+            ensure!(
                 events
                     .iter()
                     .any(|event| event["event"] == "switchover_complete"
@@ -625,12 +638,27 @@ impl Cluster {
         event: &Value,
         scenario: Scenario,
     ) -> Result<(String, Value)> {
-        let secondary = scenario != Scenario::PrimaryAppFailover;
+        let secondary = if scenario == Scenario::Switchover {
+            !event["primary_loss"]
+                .as_bool()
+                .context("post-handoff lost role")?
+        } else {
+            scenario != Scenario::PrimaryAppFailover
+        };
         let cohort: kuberic_operator::FrozenCohort =
             serde_json::from_value(event["cohort"].clone())?;
         cohort.fm_config()?;
         let index = usize::try_from(event["victim"].as_u64().context("fault victim")?)?;
         ensure!(index < cohort.bindings.len(), "foreign fault victim");
+        let expected_epoch = if scenario == Scenario::Switchover {
+            Some(
+                event["configuration_epoch"]
+                    .as_i64()
+                    .context("post-handoff configuration epoch")?,
+            )
+        } else {
+            None
+        };
         let set: kuberic_operator::KubericSet = serde_json::from_str(&self.kubectl(&[
             "-n",
             namespace,
@@ -649,6 +677,8 @@ impl Cluster {
                     .as_ref()
                     .is_some_and(|status| status.cohort().as_ref() == Some(&cohort)
                         && status.phase == kuberic_operator::ControllerPhase::Serving
+                        && expected_epoch
+                            .is_none_or(|epoch| status.configuration_epoch == Some(epoch))
                         && (status.primary_node_id.as_ref()
                             == Some(&cohort.allocation.nodes[index].node_id))
                             != secondary),

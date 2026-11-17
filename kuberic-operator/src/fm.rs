@@ -40,7 +40,12 @@ pub trait FmApi: Send + Sync {
     async fn allocation(&self) -> Result<Option<Allocation>>;
     async fn observe(&self) -> Result<Option<FmObservation>>;
     async fn start(&self, cohort: &FrozenCohort) -> Result<()>;
-    async fn switchover(&self, cohort: &FrozenCohort, target_node_id: &str) -> Result<()>;
+    async fn switchover(
+        &self,
+        cohort: &FrozenCohort,
+        target_node_id: &str,
+        previous_configuration_epoch: i64,
+    ) -> Result<()>;
     async fn shutdown(&self, cohort: &FrozenCohort) -> Result<()>;
     async fn join(&self, cohort: &FrozenCohort) -> Result<()>;
     async fn invalidate(&self, cohort: &FrozenCohort, reason: &str) -> Result<()>;
@@ -179,7 +184,12 @@ impl FmApi for ProcessFm {
         ProcessFm::shutdown(self, cohort).await
     }
 
-    async fn switchover(&self, cohort: &FrozenCohort, target_node_id: &str) -> Result<()> {
+    async fn switchover(
+        &self,
+        cohort: &FrozenCohort,
+        target_node_id: &str,
+        previous_configuration_epoch: i64,
+    ) -> Result<()> {
         let requests = {
             let session = self.session.lock().await;
             let session = session.as_ref().context("FM has not started")?;
@@ -199,6 +209,7 @@ impl FmApi for ProcessFm {
         requests
             .send(kuberic_fm::SwitchoverRequest {
                 target_node_id: target_node_id.into(),
+                previous_configuration_epoch,
                 accepted,
             })
             .await

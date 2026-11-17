@@ -16,8 +16,11 @@ fn planned_switchover_retries_old_primary_and_only_accepts_final_candidate_compl
         bootstrap(&mut state, &config);
         let original = serving(&mut state);
         let committed = decode_do_reconfiguration_reply(&original[3].1).unwrap().0;
+        let epoch = committed.unit.current.configuration;
         let target = &config.nodes[candidate].identity.id;
-        state.request_switchover(target, Duration::ZERO).unwrap();
+        state
+            .request_switchover(target, epoch, Duration::ZERO)
+            .unwrap();
         assert_eq!(state.phase(), Phase::Switching);
         assert!(state.status().service_endpoint.is_none());
         assert_eq!(state.status().primary_node_id, config.primary_node_id);
@@ -40,7 +43,9 @@ fn planned_switchover_retries_old_primary_and_only_accepts_final_candidate_compl
                 && replica.up
                 && replica.state == 2
         }));
-        state.request_switchover(target, Duration::ZERO).unwrap();
+        state
+            .request_switchover(target, epoch, Duration::ZERO)
+            .unwrap();
         assert_eq!(
             state.reconcile(Duration::from_millis(100)).unwrap(),
             vec![command.clone()]
@@ -74,14 +79,14 @@ fn planned_switchover_retries_old_primary_and_only_accepts_final_candidate_compl
         assert_eq!(&state.status().primary_node_id, target);
         assert!(state.status().switchover.unwrap().completed);
         state
-            .request_switchover(target, Duration::from_millis(100))
+            .request_switchover(target, epoch, Duration::from_millis(100))
             .unwrap();
         assert!(state
             .reconcile(Duration::from_millis(100))
             .unwrap()
             .is_empty());
         assert!(state
-            .request_switchover(&config.primary_node_id, Duration::from_millis(100))
+            .request_switchover(&config.primary_node_id, epoch, Duration::from_millis(100))
             .is_err());
         state.request_shutdown(Duration::from_millis(100)).unwrap();
         let mut deleted = Vec::new();
@@ -113,11 +118,14 @@ fn planned_switchover_retries_old_primary_and_only_accepts_final_candidate_compl
 fn switchover_rejects_unqualified_starts_and_invalid_or_missing_native_completion() {
     let config = config();
     let mut fresh = State::new(config.clone()).unwrap();
-    assert!(fresh.request_switchover("1", Duration::ZERO).is_err());
+    assert!(fresh.request_switchover("1", 0, Duration::ZERO).is_err());
     bootstrap(&mut fresh, &config);
     let replies = serving(&mut fresh);
+    let epoch = fresh.status().configuration_epoch.unwrap();
     for target in ["2", "foreign"] {
-        assert!(fresh.request_switchover(target, Duration::ZERO).is_err());
+        assert!(fresh
+            .request_switchover(target, epoch, Duration::ZERO)
+            .is_err());
         assert_eq!(fresh.phase(), Phase::Serving);
     }
     let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
@@ -127,19 +135,29 @@ fn switchover_rejects_unqualified_starts_and_invalid_or_missing_native_completio
             &replica_up_message(&app_host_loss(&config, &committed.unit, 0), Owner::Fm).unwrap(),
         )
         .unwrap();
-    assert!(fresh.request_switchover("3", Duration::ZERO).is_err());
+    assert!(fresh
+        .request_switchover("3", epoch, Duration::ZERO)
+        .is_err());
     let removal = fresh.reconcile(Duration::ZERO).unwrap().pop().unwrap();
     fresh
         .observe(removal.node, &completion(&removal.message))
         .unwrap();
     restore(&mut fresh, Duration::ZERO);
-    assert!(fresh.request_switchover("3", Duration::ZERO).is_err());
+    assert!(fresh
+        .request_switchover("3", epoch, Duration::ZERO)
+        .is_err());
+    let repaired_epoch = fresh.status().configuration_epoch.unwrap();
+    fresh
+        .request_switchover("3", repaired_epoch, Duration::ZERO)
+        .unwrap();
 
     for fault in 0..11 {
         let mut state = State::new(config.clone()).unwrap();
         bootstrap(&mut state, &config);
         serving(&mut state);
-        state.request_switchover("1", Duration::ZERO).unwrap();
+        state
+            .request_switchover("1", epoch, Duration::ZERO)
+            .unwrap();
         let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
         let request = decode_do_reconfiguration(&command.message).unwrap().0;
         let mut reply = completed_configuration(&request);
@@ -178,21 +196,18 @@ fn switchover_rejects_unqualified_starts_and_invalid_or_missing_native_completio
                 continue;
             }
             _ => {
-                let active = if fault == 10 {
+                if fault == 10 {
                     state
                         .observe(
                             0,
                             &do_reconfiguration_reply_message(&reply, Owner::Fm).unwrap(),
                         )
                         .unwrap();
-                    &reply
-                } else {
-                    &committed
-                };
+                }
                 assert!(state
                     .observe(
                         2,
-                        &replica_up_message(&app_host_loss(&config, &active.unit, 2), Owner::Fm)
+                        &replica_up_message(&app_host_loss(&config, &committed.unit, 2), Owner::Fm)
                             .unwrap()
                     )
                     .is_err());
@@ -211,6 +226,146 @@ fn switchover_rejects_unqualified_starts_and_invalid_or_missing_native_completio
         );
         assert_eq!(state.phase(), Phase::ControlUnknown);
         assert!(state.status().service_endpoint.is_none());
+    }
+}
+
+#[test]
+fn completed_handoff_recovers_each_lost_role_then_transfers_to_the_fresh_replica() {
+    for candidate in [0, 2] {
+        for victim in 0..3 {
+            let config = config();
+            let mut state = State::new(config.clone()).unwrap();
+            bootstrap(&mut state, &config);
+            serving(&mut state);
+            let first_epoch = state.status().configuration_epoch.unwrap();
+            state
+                .request_switchover(
+                    &config.nodes[candidate].identity.id,
+                    first_epoch,
+                    Duration::ZERO,
+                )
+                .unwrap();
+            let handoff = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            let reply = completion(&handoff.message);
+            state.observe(candidate, &reply).unwrap();
+            let membership = decode_do_reconfiguration_reply(&reply).unwrap().0;
+            let predecessor = membership
+                .replicas
+                .0
+                .iter()
+                .find(|replica| replica.node == config.nodes[victim].identity.native().unwrap())
+                .unwrap();
+            state
+                .observe(
+                    victim,
+                    &replica_up_message(
+                        &current_app_host_loss(&config, &membership, victim),
+                        Owner::Fm,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                state.phase(),
+                if victim == candidate {
+                    Phase::Reconfiguring
+                } else {
+                    Phase::Restoring
+                }
+            );
+            let removal = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            state.observe(candidate, &reply).unwrap();
+            let removed = completion(&removal.message);
+            state.observe(removal.node, &removed).unwrap();
+            let restored = restore(&mut state, Duration::ZERO);
+            let repaired = decode_do_reconfiguration_reply(&restored[2].1).unwrap().0;
+            let fresh = repaired
+                .replicas
+                .0
+                .iter()
+                .find(|replica| replica.node == predecessor.node)
+                .unwrap();
+            assert!(fresh.id > predecessor.id && fresh.instance > predecessor.instance);
+            let epoch = repaired.unit.current.configuration;
+            state
+                .request_switchover(&config.nodes[victim].identity.id, epoch, Duration::ZERO)
+                .unwrap();
+            let next = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            let intent = decode_do_reconfiguration(&next.message).unwrap().0;
+            assert!(intent.configuration.replicas.0.iter().any(|replica| {
+                replica.node == fresh.node
+                    && replica.id == fresh.id
+                    && replica.instance == fresh.instance
+                    && replica.current_role == 4
+            }));
+            for (source, old) in [
+                (candidate, &reply),
+                (removal.node, &removed),
+                (restored[2].0, &restored[2].1),
+            ] {
+                state.observe(source, old).unwrap();
+                assert_eq!(state.phase(), Phase::Switching);
+                assert!(state.status().service_endpoint.is_none());
+            }
+            assert!(state
+                .request_switchover(
+                    &config.nodes[candidate].identity.id,
+                    first_epoch,
+                    Duration::ZERO
+                )
+                .is_err());
+            state.observe(victim, &completion(&next.message)).unwrap();
+            assert_eq!(state.phase(), Phase::Serving);
+            assert_eq!(
+                state.status().primary_node_id,
+                config.nodes[victim].identity.id
+            );
+            assert_eq!(
+                state
+                    .status()
+                    .switchover
+                    .unwrap()
+                    .previous_configuration_epoch,
+                epoch
+            );
+        }
+    }
+}
+
+#[test]
+fn repeated_reverse_handoffs_use_current_epochs_without_a_replay_history_lifetime_limit() {
+    let config = config();
+    let mut state = State::new(config.clone()).unwrap();
+    bootstrap(&mut state, &config);
+    serving(&mut state);
+    let mut primary = 1;
+    for candidate in [0, 1, 2, 0].into_iter().cycle().take(40) {
+        if candidate == primary {
+            continue;
+        }
+        let epoch = state.status().configuration_epoch.unwrap();
+        state
+            .request_switchover(&config.nodes[candidate].identity.id, epoch, Duration::ZERO)
+            .unwrap();
+        let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        assert_eq!(command.node, primary);
+        let intent = decode_do_reconfiguration(&command.message).unwrap().0;
+        assert_eq!(intent.configuration.unit.previous.configuration, epoch);
+        assert!(state
+            .request_switchover(&config.nodes[primary].identity.id, epoch, Duration::ZERO)
+            .is_err());
+        let reply = completion(&command.message);
+        state.observe(candidate, &reply).unwrap();
+        state.observe(candidate, &reply).unwrap();
+        state
+            .request_switchover(&config.nodes[candidate].identity.id, epoch, Duration::ZERO)
+            .unwrap();
+        assert!(state.reconcile(Duration::ZERO).unwrap().is_empty());
+        assert_eq!(
+            state.status().configuration_epoch,
+            Some(epoch + 0x1_0000_0001)
+        );
+        primary = candidate;
     }
 }
 

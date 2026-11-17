@@ -72,12 +72,19 @@ async fn drive_unrouted(fixture: &Fixture) {
 
 #[tokio::test]
 async fn deleting_during_primary_reconfiguration_finishes_it_without_client_publication() {
-    deleting_during_repair(false).await;
+    deleting_during_repair(false, false).await;
 }
 
 #[tokio::test]
 async fn deleting_during_secondary_repair_finishes_it_without_client_publication() {
-    deleting_during_repair(true).await;
+    deleting_during_repair(true, false).await;
+}
+
+#[tokio::test]
+async fn deleting_during_post_handoff_recovery_finishes_repair_without_republishing() {
+    for secondary in [false, true] {
+        deleting_during_repair(secondary, true).await;
+    }
 }
 
 #[tokio::test]
@@ -86,6 +93,17 @@ async fn deleting_during_switchover_waits_for_native_handoff_without_republishin
     fixture.serving().await;
     let mut set = fixture.set().await;
     let cohort = set.status.as_ref().unwrap().cohort().unwrap();
+    set.status.as_mut().unwrap().target_primary_node_id =
+        Some(cohort.allocation.nodes[2].node_id.clone());
+    Api::<KubericSet>::namespaced(fixture.client.clone(), NAMESPACE)
+        .replace_status(NAME, &PostParams::default(), &set)
+        .await
+        .unwrap();
+    fixture.drive().await;
+    let first = fixture.fm.command().await;
+    fixture.fm.complete(&first).await;
+    fixture.drive().await;
+    let mut set = fixture.set().await;
     set.status.as_mut().unwrap().target_primary_node_id =
         Some(cohort.allocation.nodes[0].node_id.clone());
     Api::<KubericSet>::namespaced(fixture.client.clone(), NAMESPACE)
@@ -114,10 +132,23 @@ async fn deleting_during_switchover_waits_for_native_handoff_without_republishin
     fixture.api.check();
 }
 
-async fn deleting_during_repair(secondary: bool) {
+async fn deleting_during_repair(secondary: bool, handoff: bool) {
     let fixture = Fixture::new().await;
     fixture.serving().await;
     let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+    if handoff {
+        let mut set = fixture.set().await;
+        set.status.as_mut().unwrap().target_primary_node_id =
+            Some(cohort.allocation.nodes[2].node_id.clone());
+        Api::<KubericSet>::namespaced(fixture.client.clone(), NAMESPACE)
+            .replace_status(NAME, &PostParams::default(), &set)
+            .await
+            .unwrap();
+        fixture.drive().await;
+        let command = fixture.fm.command().await;
+        fixture.fm.complete(&command).await;
+        fixture.drive().await;
+    }
     if secondary {
         fixture.fm.lose_application(0).await;
     } else {

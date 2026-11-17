@@ -12,6 +12,7 @@ use crate::{Config, Phase, State, Status};
 
 pub struct SwitchoverRequest {
     pub target_node_id: String,
+    pub previous_configuration_epoch: i64,
     pub accepted: oneshot::Sender<Result<()>>,
 }
 
@@ -135,7 +136,11 @@ async fn drive(
         }
         tokio::select! {
             Some(request) = requests.recv(), if !stopping => {
-                let result = state.request_switchover(&request.target_node_id, started.elapsed());
+                let result = state.request_switchover(
+                    &request.target_node_id,
+                    request.previous_configuration_epoch,
+                    started.elapsed(),
+                );
                 publish(state, previous, observe)?;
                 request.accepted.send(result)
                     .map_err(|_| anyhow::anyhow!("switchover request owner dropped before acceptance"))?;

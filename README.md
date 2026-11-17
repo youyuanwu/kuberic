@@ -25,8 +25,10 @@ API, local processes and an isolated KinD cluster. The operator provides a
 namespace-scoped watch/requeue loop, image build and installation manifests;
 it is not production-ready or restart-recoverable. The supported failover is
 an application-process crash, not Node/Pod loss or a network partition.
-One healthy planned 3/2 switchover is also supported through the original native
-owners, without rebuilding replicas or replacing Pods.
+Repeated/reverse healthy planned 3/2 switchovers are supported through the
+original native owners, including after completed application-crash repair.
+An application crash after completed handoff uses the same native failover
+and fresh-replica restoration path on its original Pod.
 There is no replica persistence/restart recovery, Node replacement, reconnect,
 resize or rolling upgrade. FM state is in-memory; restarting the FM does not
 recover the deployment. A lost original
@@ -207,15 +209,26 @@ Only the selected candidate's exact successful `DoReconfigurationReply` can
 publish its endpoint and original Pod UID. Endpoint notifications are ACKed but
 never authorize publication. Original Node/application owners and replica
 identities remain unchanged. Exact requests and native retries are idempotent.
-`status.switchover` records the accepted source, target and native completion;
-like other status, it cannot recover a lost backend.
+`status.configurationEpoch` identifies the latest native-completed membership.
+`status.switchover` records the latest accepted source, target, previous/new
+configuration epochs and native completion; like other status, these diagnostic
+fields cannot recover a lost backend. Requests carry the observed completed
+epoch to the original FM, so a delayed command cannot start another operation
+against repaired or newer membership.
 
-The qualified scope is one healthy handoff from the initial fully admitted
-3/2 membership, followed by ordinary operation and teardown. Transfer after
-repair, reverse/repeated transfer, cancellation or retargeting after native
-acceptance, and application loss during or after handoff block explicitly.
-Cases needing native Secondary restart/rebuild also block rather than reducing
-membership or inventing progress. Deletion during an accepted handoff keeps
+Healthy handoffs can repeat or reverse from current fully admitted 3/2
+membership, including freshly repaired replica incarnations. After completed
+handoff, loss of the new Primary runs native failover; loss of the former
+Primary or unchanged Secondary runs same-Primary removal. Both restore a fresh
+replica on that same original Node/Pod after positive predecessor cleanup and
+real copy/build, then permit another handoff. No application spare pool or
+persisted Reopen is involved. After failover, the desired target follows the
+admitted Primary; a historical handoff receipt does not request automatic failback.
+
+Application loss during handoff or repair, and cancellation/retargeting before
+accepted completion is observed, still block. Kuberic rejects handoff completion
+with missing/down members rather than inventing progress or spare placement.
+Deletion during an accepted handoff keeps
 routing disabled, waits for its native completion and deletes the final
 membership. See [request instructions](kuberic-operator/README.md#planned-switchover).
 

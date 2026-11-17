@@ -119,7 +119,14 @@ selector, verifies acknowledged data and continued writes through the ClusterIP,
 and verifies that a direct write to the old Primary is rejected as `NotPrimary`.
 Every original Pod UID/container lifetime is retained. The host correlates
 final native deletion and positive cleanup with that same cohort and new
-Primary. Repeated/reverse transfer and recovery overlaps are not qualified.
+Primary. It performs repeated/reverse handoffs with a distinct acknowledged
+write after each operation, then crashes the admitted Primary and a later
+former-Primary Secondary after completed handoffs. The host positively verifies
+same-Pod fresh replica restoration and predecessor cleanup before each later
+handoff to the rebuilt member. Completed epoch receipts must advance, passive
+targets must follow native failover without automatic failback, and final
+native/physical cleanup must reflect the last admitted Primary. Failure during
+an unfinished handoff or repair remains outside this deployed journey.
 
 The copy-held Secondary repair variant uses a separate qualification package:
 a startup wrapper enables the sample's existing copy barrier before the fresh

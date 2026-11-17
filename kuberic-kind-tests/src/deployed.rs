@@ -126,7 +126,32 @@ pub async fn run(scenario: Scenario) -> Result<()> {
             })
         );
         if scenario == Scenario::Switchover {
-            switchover(&sets, &services, &client, &started, &endpoint).await?;
+            let mut current = started.clone();
+            let mut next_write = 2;
+            for target in [0, 1, 2] {
+                current = switchover(
+                    &sets, &services, &client, &current, &endpoint, target, next_write,
+                )
+                .await?;
+                next_write += 1;
+            }
+            for (cycle, victim) in [2, 0].into_iter().enumerate() {
+                current = recover_after_handoff(
+                    &sets,
+                    &services,
+                    &client,
+                    &current,
+                    &endpoint,
+                    (cycle, victim, next_write),
+                )
+                .await?;
+                next_write += 1;
+                current = switchover(
+                    &sets, &services, &client, &current, &endpoint, victim, next_write,
+                )
+                .await?;
+                next_write += 1;
+            }
         }
         if matches!(
             scenario,
@@ -404,7 +429,9 @@ async fn switchover(
     client: &Client,
     original: &KubericSet,
     endpoint: &str,
-) -> Result<()> {
+    target_index: usize,
+    next_write: usize,
+) -> Result<KubericSet> {
     let name = original.name_any();
     let uid = original.uid().context("switchover parent UID")?;
     let before = original.status.as_ref().context("original status")?;
@@ -413,7 +440,7 @@ async fn switchover(
         .service_endpoint
         .as_ref()
         .context("old Primary endpoint")?;
-    let target = &cohort.allocation.nodes[0].node_id;
+    let target = &cohort.allocation.nodes[target_index].node_id;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let state: serde_json::Value =
@@ -437,12 +464,11 @@ async fn switchover(
         let current = sets.get(&name).await?;
         ensure!(
             current.uid().as_deref() == Some(&uid)
-                && current
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.phase == ControllerPhase::Serving
-                        && status.primary_node_id == before.primary_node_id
-                        && status.target_primary_node_id == before.target_primary_node_id),
+                && current.status.as_ref().is_some_and(|status| status.phase
+                    == ControllerPhase::Serving
+                    && status.primary_node_id == before.primary_node_id
+                    && status.configuration_epoch == before.configuration_epoch
+                    && status.target_primary_node_id == before.target_primary_node_id),
             "switchover request raced changed authority: {current:?}"
         );
         let patch = serde_json::json!({
@@ -477,10 +503,11 @@ async fn switchover(
         if status.phase == ControllerPhase::Serving
             && status.primary_node_id.as_ref() == Some(target)
             && status.target_primary_node_id.as_ref() == Some(target)
-            && status
-                .switchover
-                .as_ref()
-                .is_some_and(|swap| swap.completed)
+            && status.switchover.as_ref().is_some_and(|swap| {
+                swap.completed
+                    && Some(swap.previous_configuration_epoch) == before.configuration_epoch
+                    && Some(swap.configuration_epoch) == status.configuration_epoch
+            })
         {
             let service = services.get(&resources::write_service_name(&name)).await?;
             ensure!(
@@ -489,10 +516,10 @@ async fn switchover(
                     .as_ref()
                     .and_then(|spec| spec.selector.as_ref())
                     .and_then(|selector| selector.get(resources::POD_UID))
-                    == Some(&cohort.bindings[0].pod_uid),
+                    == Some(&cohort.bindings[target_index].pod_uid),
                 "Service selected the wrong switchover Pod UID"
             );
-            let rejected = application(old_endpoint, "write-final").await?;
+            let rejected = application(old_endpoint, "write 9999").await?;
             ensure!(
                 rejected.contains("NotPrimary"),
                 "old writer remained writable: {rejected}"
@@ -500,13 +527,14 @@ async fn switchover(
             wait_for_service(endpoint).await?;
             let preserved = application(endpoint, "read").await?;
             ensure!(
-                preserved.contains("value=acknowledged"),
+                preserved.contains(&format!("committed={} ", next_write - 1)),
                 "handoff lost data: {preserved}"
             );
-            let written = application(endpoint, "write-more").await?;
+            let written = application(endpoint, &format!("write {next_write}")).await?;
             let continued = application(endpoint, "read").await?;
             ensure!(
-                written.starts_with("OK") && continued.contains("value=continued"),
+                written.starts_with("OK")
+                    && continued.contains(&format!("committed={next_write} ")),
                 "switched Service did not continue writes: {written}; {continued}"
             );
             let pods: Api<Pod> = Api::namespaced(client.clone(), &cohort.allocation.namespace);
@@ -538,10 +566,11 @@ async fn switchover(
                 serde_json::json!({
                     "event": "switchover_complete", "set_uid": uid, "cohort": cohort,
                     "primary_node_id": target, "data_preserved": true,
+                    "configuration_epoch": status.configuration_epoch,
                     "old_writer_revoked": true, "original_nodes_unchanged": true
                 })
             );
-            return Ok(());
+            return Ok(current);
         }
         ensure!(
             Instant::now() < deadline,
@@ -549,4 +578,133 @@ async fn switchover(
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn recover_after_handoff(
+    sets: &Api<KubericSet>,
+    services: &Api<Service>,
+    client: &Client,
+    original: &KubericSet,
+    endpoint: &str,
+    step: (usize, usize, usize),
+) -> Result<KubericSet> {
+    let (cycle, victim, next_write) = step;
+    let before = original
+        .status
+        .as_ref()
+        .context("completed handoff status")?;
+    let cohort = before.cohort().context("completed handoff cohort")?;
+    let primary_loss =
+        before.primary_node_id.as_ref() == Some(&cohort.allocation.nodes[victim].node_id);
+    let primary = if primary_loss {
+        (0..3)
+            .find(|node| *node != victim)
+            .context("surviving candidate")?
+    } else {
+        cohort
+            .allocation
+            .nodes
+            .iter()
+            .position(|node| Some(&node.node_id) == before.primary_node_id.as_ref())
+            .context("current Primary")?
+    };
+    let namespace = &cohort.allocation.namespace;
+    let uid = original.uid().context("original KubericSet UID")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state: serde_json::Value =
+            serde_json::from_str(&application(endpoint, "state").await?)?;
+        let last = state["provider"]["last"].as_i64().context("provider LSN")?;
+        if state["peers"].as_array().is_some_and(|peers| {
+            peers.len() == 2
+                && peers
+                    .iter()
+                    .all(|peer| peer["applied"].as_i64().is_some_and(|lsn| lsn >= last))
+        }) {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "post-handoff peers did not apply: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "application_fault_ready", "set_uid": uid, "cohort": cohort,
+            "cycle": cycle, "victim": victim, "primary_loss": primary_loss,
+            "configuration_epoch": before.configuration_epoch,
+            "primary_endpoint": before.service_endpoint,
+        })
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "repair_inspection_ready", "set_uid": uid, "cohort": cohort,
+            "cycle": cycle, "victim": victim,
+        })
+    );
+    await_host_restoration(client, namespace, cycle, &uid).await?;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let current = loop {
+        let current = sets.get(&original.name_any()).await?;
+        let status = current
+            .status
+            .as_ref()
+            .context("post-handoff repair status")?;
+        ensure!(
+            current.uid().as_deref() == Some(&uid)
+                && status.cohort().as_ref() == Some(&cohort)
+                && status.phase != ControllerPhase::Blocked,
+            "post-handoff recovery lost original authority: {current:?}"
+        );
+        if status.phase == ControllerPhase::Serving
+            && status.configuration_epoch > before.configuration_epoch
+            && status.primary_node_id.as_ref() == Some(&cohort.allocation.nodes[primary].node_id)
+        {
+            break current;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "post-handoff repair timed out: {current:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let status = current.status.as_ref().context("repaired status")?;
+    let service = services
+        .get(&resources::write_service_name(&original.name_any()))
+        .await?;
+    ensure!(
+        service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.selector.as_ref())
+            .and_then(|selector| selector.get(resources::POD_UID))
+            == Some(&cohort.bindings[primary].pod_uid)
+            && (status.service_endpoint == before.service_endpoint) != primary_loss
+            && status.target_primary_node_id == status.primary_node_id,
+        "post-handoff repair published the wrong Primary"
+    );
+    wait_for_service(endpoint).await?;
+    let preserved = application(endpoint, "read").await?;
+    ensure!(
+        preserved.contains(&format!("committed={} ", next_write - 1)),
+        "repair lost writes: {preserved}"
+    );
+    let written = application(endpoint, &format!("write {next_write}")).await?;
+    ensure!(
+        written.starts_with("OK") && written.contains(&format!("committed={next_write} ")),
+        "repair stopped writes: {written}"
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": if primary_loss { "primary_app_failover" } else { "secondary_app_repair" },
+            "set_uid": uid, "cohort": cohort, "cycle": cycle,
+            "primary_node_id": cohort.allocation.nodes[primary].node_id,
+            "data_preserved": true, "writes_continued": true, "original_nodes_unchanged": true,
+        })
+    );
+    Ok(current)
 }

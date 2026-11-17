@@ -72,6 +72,7 @@ impl Cluster {
                 run_directory: root.path().join(format!("node{}", index + 1)),
                 startup_timeout_ms: 30_000,
                 shutdown_timeout_ms: 20_000,
+                remote_replica_progress_query_wait_ms: 30_000,
             }
         }).collect();
         let mut nodes = Vec::new();

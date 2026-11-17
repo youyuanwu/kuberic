@@ -35,6 +35,7 @@ pub struct Status {
     pub bootstrapped_nodes: usize,
     pub deleted_nodes: usize,
     pub primary_node_id: String,
+    pub configuration_epoch: Option<i64>,
     pub service_endpoint: Option<String>,
     pub replication_endpoint: Option<String>,
     pub error: Option<String>,
@@ -46,6 +47,8 @@ pub struct Status {
 pub struct Switchover {
     pub source_node_id: String,
     pub target_node_id: String,
+    pub previous_configuration_epoch: i64,
+    pub configuration_epoch: i64,
     pub completed: bool,
 }
 
@@ -231,6 +234,10 @@ impl State {
             bootstrapped_nodes: self.bootstrapped.iter().filter(|ready| **ready).count(),
             deleted_nodes: self.deleted.iter().filter(|deleted| **deleted).count(),
             primary_node_id: self.config.nodes[self.primary].identity.id.clone(),
+            configuration_epoch: self
+                .configured
+                .as_ref()
+                .map(|reply| reply.unit.current.configuration),
             service_endpoint: primary
                 .filter(|_| serving)
                 .map(|replica| replica.service_endpoint.clone()),
@@ -968,8 +975,8 @@ impl State {
 
     fn app_host_lost(&mut self, node: usize, report: &ReplicaUp) -> Result<()> {
         ensure!(
-            self.switchover.is_none(),
-            "application loss during or after planned switchover is not qualified"
+            self.switchover.as_ref().is_none_or(|swap| swap.completed),
+            "application loss during planned switchover is not qualified"
         );
         ensure!(
             self.phase() == Phase::Serving && self.pending.is_none(),
@@ -1134,12 +1141,21 @@ impl State {
         })
     }
 
-    pub fn request_switchover(&mut self, target_node_id: &str, now: Duration) -> Result<()> {
+    pub fn request_switchover(
+        &mut self,
+        target_node_id: &str,
+        previous_configuration_epoch: i64,
+        now: Duration,
+    ) -> Result<()> {
         self.healthy()?;
-        if let Some(swap) = &self.switchover {
+        if let Some(swap) = self
+            .switchover
+            .as_ref()
+            .filter(|swap| swap.previous_configuration_epoch == previous_configuration_epoch)
+        {
             ensure!(
                 swap.target_node_id == target_node_id,
-                "switchover cancellation, retargeting and repeated handoff are unsupported"
+                "accepted switchover cannot be retargeted"
             );
             return Ok(());
         }
@@ -1164,17 +1180,17 @@ impl State {
         ensure!(
             completed.unit.previous == Epoch::default()
                 && completed.unit.current.data_loss == self.initial.unit.current.data_loss
-                && completed.unit.current.configuration
-                    == self.initial.unit.current.configuration + 1
+                && completed.unit.current.configuration == previous_configuration_epoch
+                && completed.unit.target == 3
+                && completed.unit.minimum == 2
                 && completed.replicas.0.len() == 3
                 && completed
                     .replicas
                     .0
                     .iter()
                     .all(|r| r.up && r.state == 2 && matches!(r.current_role, 3 | 4))
-                && self.losses.iter().all(Option::is_none)
-                && self.retired_losses.is_empty(),
-            "switchover after repair or another configuration round is not qualified"
+                && self.losses.iter().all(Option::is_none),
+            "switchover requires the exact current healthy completed 3/2 membership"
         );
         let mut configuration = Configuration {
             unit: completed.unit.clone(),
@@ -1199,6 +1215,7 @@ impl State {
             replica.first_lsn = -1;
             replica.last_lsn = -1;
         }
+        let configuration_epoch = configuration.unit.current.configuration;
         self.clock(now)?;
         self.configuration = Some(DoReconfiguration {
             configuration,
@@ -1207,6 +1224,8 @@ impl State {
         self.switchover = Some(Switchover {
             source_node_id: self.config.nodes[self.primary].identity.id.clone(),
             target_node_id: target_node_id.into(),
+            previous_configuration_epoch,
+            configuration_epoch,
             completed: false,
         });
         Ok(())

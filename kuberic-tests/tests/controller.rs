@@ -116,7 +116,6 @@ async fn switchover_refuses_foreign_targets_cancellation_retargeting_and_stale_e
             if fault == 3 {
                 let command = fixture.fm.command().await;
                 fixture.fm.complete(&command).await;
-                fixture.drive().await;
             }
             request_switchover(
                 &fixture,
@@ -165,35 +164,131 @@ async fn switchover_refuses_foreign_targets_cancellation_retargeting_and_stale_e
 }
 
 #[tokio::test]
-async fn switchover_after_repair_blocks_when_original_fm_refuses_admission() {
+async fn edited_handoff_receipts_never_grant_native_completion_or_another_transfer() {
+    for fault in 0..3 {
+        let fixture = Fixture::new().await;
+        fixture.serving().await;
+        let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+        request_switchover(&fixture, Some(cohort.allocation.nodes[0].node_id.clone())).await;
+        fixture.drive().await;
+        let mut set = fixture.set().await;
+        let receipt = set.status.as_mut().unwrap().switchover.as_mut().unwrap();
+        match fault {
+            0 => receipt.configuration_epoch += 1,
+            1 => receipt.source_node_id = cohort.allocation.nodes[2].node_id.clone(),
+            _ => receipt.completed = true,
+        }
+        Api::<KubericSet>::namespaced(fixture.client.clone(), NAMESPACE)
+            .replace_status(NAME, &PostParams::default(), &set)
+            .await
+            .unwrap();
+        let result = fixture.controller.reconcile(NAME).await.unwrap();
+        assert!(result.blocked.is_some(), "fault {fault}");
+        assert_disabled(&fixture).await;
+        fixture.api.check();
+    }
+}
+
+#[tokio::test]
+async fn completed_handoffs_compose_with_each_app_loss_repair_and_new_status_requests() {
+    for victim in 0..3 {
+        let fixture = Fixture::new().await;
+        fixture.serving().await;
+        let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+        request_switchover(&fixture, Some(cohort.allocation.nodes[0].node_id.clone())).await;
+        fixture.drive().await;
+        let first = fixture.fm.command().await;
+        fixture.fm.complete(&first).await;
+        fixture.drive().await;
+        let receipt = fixture.set().await.status.unwrap().switchover.unwrap();
+        fixture.fm.lose_application(victim).await;
+        fixture.drive().await;
+        let removal = fixture.fm.command().await;
+        fixture.fm.complete(&removal).await;
+        fixture.fm.restore().await;
+        fixture.drive().await;
+        let repaired = fixture.set().await.status.unwrap();
+        assert_eq!(repaired.target_primary_node_id, repaired.primary_node_id);
+        assert_eq!(repaired.switchover.as_ref(), Some(&receipt));
+        assert!(repaired.configuration_epoch.unwrap() > receipt.configuration_epoch);
+        for target in [victim, (victim + 1) % 3, victim] {
+            request_switchover(
+                &fixture,
+                Some(cohort.allocation.nodes[target].node_id.clone()),
+            )
+            .await;
+            fixture.drive().await;
+            assert_disabled(&fixture).await;
+            let switching = fixture.set().await.status.unwrap();
+            assert_eq!(switching.phase, ControllerPhase::Switching);
+            assert!(switching.service_endpoint.is_none());
+            let accepted = switching.switchover.as_ref().unwrap();
+            assert_eq!(
+                Some(accepted.previous_configuration_epoch),
+                switching.configuration_epoch
+            );
+            assert!(!accepted.completed);
+            let command = fixture.fm.command().await;
+            fixture.fm.complete(&command).await;
+            fixture.drive().await;
+            let complete = fixture.set().await.status.unwrap();
+            assert_eq!(complete.phase, ControllerPhase::Serving);
+            assert_eq!(complete.primary_node_id, complete.target_primary_node_id);
+            assert_eq!(
+                complete.primary_node_id.as_ref(),
+                Some(&cohort.allocation.nodes[target].node_id)
+            );
+            assert_eq!(
+                complete.configuration_epoch,
+                Some(accepted.configuration_epoch)
+            );
+            assert!(complete.switchover.unwrap().completed);
+            assert_eq!(
+                selector(&fixture).await.unwrap().get(POD_UID),
+                Some(&cohort.bindings[target].pod_uid)
+            );
+        }
+        fixture.api.check();
+    }
+}
+
+#[tokio::test]
+async fn completed_repair_fences_a_previously_planned_handoff_effect_and_backend_command() {
     let fixture = Fixture::new().await;
     fixture.serving().await;
     let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+    let target = &cohort.allocation.nodes[2].node_id;
+    request_switchover(&fixture, Some(target.clone())).await;
+    fixture.controller.reconcile(NAME).await.unwrap();
+    fixture.controller.reconcile(NAME).await.unwrap();
+    let observation = fixture.controller.observe(NAME).await.unwrap();
+    let plan = evaluate(&observation, &support::settings());
+    let Plan::Switchover {
+        previous_configuration_epoch,
+        ..
+    } = &plan
+    else {
+        panic!("{plan:?}")
+    };
     fixture.fm.lose_application(0).await;
     let removal = fixture.fm.command().await;
     fixture.fm.complete(&removal).await;
     fixture.fm.restore().await;
-    fixture.drive().await;
-    request_switchover(&fixture, Some(cohort.allocation.nodes[2].node_id.clone())).await;
-    let mut blocked = None;
-    for _ in 0..4 {
-        let outcome = fixture.controller.reconcile(NAME).await.unwrap();
-        if outcome.blocked.is_some() {
-            blocked = outcome.blocked;
-            break;
-        }
-    }
-    assert!(blocked.unwrap().contains("after repair"));
-    assert_disabled(&fixture).await;
     assert!(fixture
         .fm
-        .observe()
+        .switchover(&cohort, target, *previous_configuration_epoch)
         .await
-        .unwrap()
-        .unwrap()
-        .status
-        .switchover
-        .is_none());
+        .is_err());
+    let error = fixture
+        .controller
+        .apply(&observation, plan)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<StaleObservation>(),
+        Some(&StaleObservation::Premise)
+    );
+    assert_disabled(&fixture).await;
     fixture.api.check();
 }
 
