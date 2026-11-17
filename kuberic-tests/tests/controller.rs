@@ -35,6 +35,168 @@ async fn assert_disabled(fixture: &Fixture) {
     );
 }
 
+async fn request_switchover(fixture: &Fixture, target: Option<String>) {
+    let mut set = fixture.set().await;
+    set.status.as_mut().unwrap().target_primary_node_id = target;
+    Api::<KubericSet>::namespaced(fixture.client.clone(), NAMESPACE)
+        .replace_status(NAME, &PostParams::default(), &set)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn status_target_withdraws_routing_before_handoff_and_retries_with_original_backend() {
+    let fixture = Fixture::new().await;
+    fixture.serving().await;
+    let original = fixture.set().await;
+    let cohort = original.status.as_ref().unwrap().cohort().unwrap();
+    let target = cohort.allocation.nodes[2].node_id.clone();
+    request_switchover(&fixture, Some(target.clone())).await;
+    let observation = fixture.controller.observe(NAME).await.unwrap();
+    let plan = evaluate(&observation, &support::settings());
+    assert_eq!(
+        plan,
+        Plan::Route(resources::disabled_selector(&original).unwrap())
+    );
+    assert!(fixture
+        .fm
+        .observe()
+        .await
+        .unwrap()
+        .unwrap()
+        .status
+        .switchover
+        .is_none());
+    fixture.controller.apply(&observation, plan).await.unwrap();
+    assert_disabled(&fixture).await;
+    fixture.api.lose_next_response(Kind::Set, true);
+    assert!(fixture.controller.reconcile(NAME).await.is_err());
+    fixture.drive().await;
+    let switching = fixture.set().await.status.unwrap();
+    assert_eq!(switching.phase, ControllerPhase::Switching);
+    assert_eq!(
+        switching.primary_node_id,
+        original.status.as_ref().unwrap().primary_node_id
+    );
+    assert!(switching.service_endpoint.is_none());
+    assert!(!switching.switchover.unwrap().completed);
+    let command = fixture.fm.command().await;
+    assert_eq!(command.node, 1);
+    let recreated = fixture.recreate();
+    assert!(!recreated.reconcile(NAME).await.unwrap().changed);
+    assert_eq!(fixture.fm.retry().await, command);
+    fixture.fm.complete(&command).await;
+    fixture.drive().await;
+    let complete = fixture.set().await.status.unwrap();
+    assert_eq!(complete.phase, ControllerPhase::Serving);
+    assert_eq!(complete.primary_node_id, Some(target.clone()));
+    assert_eq!(complete.target_primary_node_id, Some(target));
+    assert!(complete.switchover.as_ref().unwrap().completed);
+    assert_eq!(complete.cohort(), Some(cohort.clone()));
+    assert_eq!(
+        selector(&fixture).await.unwrap().get(POD_UID),
+        Some(&cohort.bindings[2].pod_uid)
+    );
+    assert!(!fixture.controller.reconcile(NAME).await.unwrap().changed);
+    assert_eq!(fixture.fm.starts.load(Ordering::SeqCst), 1);
+    fixture.api.check();
+}
+
+#[tokio::test]
+async fn switchover_refuses_foreign_targets_cancellation_retargeting_and_stale_effects() {
+    for fault in 0..4 {
+        let fixture = Fixture::new().await;
+        fixture.serving().await;
+        let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+        if fault == 0 {
+            request_switchover(&fixture, Some("foreign".into())).await;
+        } else {
+            request_switchover(&fixture, Some(cohort.allocation.nodes[0].node_id.clone())).await;
+            fixture.drive().await;
+            if fault == 3 {
+                let command = fixture.fm.command().await;
+                fixture.fm.complete(&command).await;
+                fixture.drive().await;
+            }
+            request_switchover(
+                &fixture,
+                if fault == 1 {
+                    None
+                } else {
+                    Some(cohort.allocation.nodes[2].node_id.clone())
+                },
+            )
+            .await;
+        }
+        let outcome = fixture.controller.reconcile(NAME).await.unwrap();
+        assert!(outcome.blocked.is_some(), "fault {fault}");
+        assert_disabled(&fixture).await;
+        fixture.api.check();
+    }
+    let fixture = Fixture::new().await;
+    fixture.serving().await;
+    let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+    request_switchover(&fixture, Some(cohort.allocation.nodes[0].node_id.clone())).await;
+    fixture.controller.reconcile(NAME).await.unwrap();
+    fixture.controller.reconcile(NAME).await.unwrap();
+    let observation = fixture.controller.observe(NAME).await.unwrap();
+    let plan = evaluate(&observation, &support::settings());
+    assert!(matches!(plan, Plan::Switchover { .. }));
+    request_switchover(&fixture, Some(cohort.allocation.nodes[2].node_id.clone())).await;
+    let error = fixture
+        .controller
+        .apply(&observation, plan)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<StaleObservation>(),
+        Some(&StaleObservation::Resources)
+    );
+    assert!(fixture
+        .fm
+        .observe()
+        .await
+        .unwrap()
+        .unwrap()
+        .status
+        .switchover
+        .is_none());
+    fixture.api.check();
+}
+
+#[tokio::test]
+async fn switchover_after_repair_blocks_when_original_fm_refuses_admission() {
+    let fixture = Fixture::new().await;
+    fixture.serving().await;
+    let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+    fixture.fm.lose_application(0).await;
+    let removal = fixture.fm.command().await;
+    fixture.fm.complete(&removal).await;
+    fixture.fm.restore().await;
+    fixture.drive().await;
+    request_switchover(&fixture, Some(cohort.allocation.nodes[2].node_id.clone())).await;
+    let mut blocked = None;
+    for _ in 0..4 {
+        let outcome = fixture.controller.reconcile(NAME).await.unwrap();
+        if outcome.blocked.is_some() {
+            blocked = outcome.blocked;
+            break;
+        }
+    }
+    assert!(blocked.unwrap().contains("after repair"));
+    assert_disabled(&fixture).await;
+    assert!(fixture
+        .fm
+        .observe()
+        .await
+        .unwrap()
+        .unwrap()
+        .status
+        .switchover
+        .is_none());
+    fixture.api.check();
+}
+
 #[tokio::test]
 async fn primary_application_failover_withdraws_then_routes_only_native_completed_original_primary()
 {

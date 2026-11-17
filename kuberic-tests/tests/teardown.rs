@@ -80,6 +80,40 @@ async fn deleting_during_secondary_repair_finishes_it_without_client_publication
     deleting_during_repair(true).await;
 }
 
+#[tokio::test]
+async fn deleting_during_switchover_waits_for_native_handoff_without_republishing() {
+    let fixture = Fixture::new().await;
+    fixture.serving().await;
+    let mut set = fixture.set().await;
+    let cohort = set.status.as_ref().unwrap().cohort().unwrap();
+    set.status.as_mut().unwrap().target_primary_node_id =
+        Some(cohort.allocation.nodes[0].node_id.clone());
+    Api::<KubericSet>::namespaced(fixture.client.clone(), NAMESPACE)
+        .replace_status(NAME, &PostParams::default(), &set)
+        .await
+        .unwrap();
+    fixture.drive().await;
+    let command = fixture.fm.command().await;
+    request_delete(&fixture).await;
+    drive_unrouted(&fixture).await;
+    assert!(fixture.set().await.status.unwrap().teardown.is_none());
+    assert_eq!(fixture.fm.shutdowns.load(Ordering::SeqCst), 0);
+    fixture.fm.complete(&command).await;
+    drive_unrouted(&fixture).await;
+    assert_eq!(fixture.fm.shutdowns.load(Ordering::SeqCst), 1);
+    pod_deletions(&fixture).await;
+    joined_processes(&fixture, &cohort).await;
+    fixture.drive().await;
+    assert!(
+        Api::<KubericSet>::namespaced(fixture.client.clone(), NAMESPACE)
+            .get_opt(NAME)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture.api.check();
+}
+
 async fn deleting_during_repair(secondary: bool) {
     let fixture = Fixture::new().await;
     fixture.serving().await;

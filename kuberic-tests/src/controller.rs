@@ -131,7 +131,22 @@ impl ScriptedFm {
         let reply = native_completion(&outbound.message);
         let mut session = self.session.lock().await;
         let session = session.as_mut().unwrap();
-        session.state.observe(outbound.node, &reply).unwrap();
+        let source = session
+            .state
+            .status()
+            .switchover
+            .filter(|swap| !swap.completed)
+            .map(|swap| {
+                session
+                    .cohort
+                    .allocation
+                    .nodes
+                    .iter()
+                    .position(|node| node.node_id == swap.target_node_id)
+                    .unwrap()
+            })
+            .unwrap_or(outbound.node);
+        session.state.observe(source, &reply).unwrap();
         if outbound.message.properties().unwrap().action == "DoReconfiguration" {
             session.configured = Some(decode_do_reconfiguration_reply(&reply).unwrap().0);
         }
@@ -246,6 +261,14 @@ impl FmApi for ScriptedFm {
             _ => anyhow::bail!("scripted native create has not completed"),
         }
         Ok(())
+    }
+    async fn switchover(&self, cohort: &FrozenCohort, target_node_id: &str) -> Result<()> {
+        let mut session = self.session.lock().await;
+        let session = session.as_mut().context("missing scripted FM")?;
+        ensure!(session.cohort == *cohort, "different scripted switchover");
+        session
+            .state
+            .request_switchover(target_node_id, session.now)
     }
     async fn join(&self, cohort: &FrozenCohort) -> Result<()> {
         let mut session = self.session.lock().await;

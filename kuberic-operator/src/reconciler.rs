@@ -394,6 +394,16 @@ impl Reconciler {
                 self.status(set, next).await?;
             }
             Plan::ShutdownFm(cohort) => self.fm.shutdown(&cohort).await?,
+            Plan::Switchover {
+                cohort,
+                target_node_id,
+            } => {
+                if let Err(error) = self.fm.switchover(&cohort, &target_node_id).await {
+                    return self
+                        .block(&current, format!("native switchover refused: {error:#}"))
+                        .await;
+                }
+            }
             Plan::JoinFm(cohort) => self.fm.join(&cohort).await?,
             Plan::DeletePod(index) => {
                 let pod = current

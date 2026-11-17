@@ -137,8 +137,9 @@ async fn lagging_paused_survivor_cannot_grant_failover_without_native_progress()
     assert_eq!(cluster.node_status(0)["application_pid"], paused.pid);
     assert_ne!(cluster.node_status(2)["replica_role"], 4);
     eprintln!("lagging/unresponsive native progress refusal: {refused}");
-    drop(paused);
+    // Resuming progress could restart retained native work after FM withdrawal.
     cluster.cleanup_failed().await;
+    drop(paused);
 }
 
 #[tokio::test]

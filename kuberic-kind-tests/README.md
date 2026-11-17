@@ -55,7 +55,8 @@ The host test process prepares and observes the isolated cluster. Ordinary
 bootstrap, early-deletion and application-crash journeys install the generated namespace-scoped
 operator Deployment/RBAC. Their Job only creates/deletes KubericSets, sends
 application requests and observes results; its Role cannot mutate workload
-resources or parent status. The operator owns reconciliation and native FM
+resources or parent status, except for the switchover scenario's explicit
+`kubericsets/status` patch permission. The operator owns reconciliation and native FM
 listeners. The host independently matches its final native-join/cleanup events
 to the exact cohort observed by the driver.
 
@@ -110,6 +111,15 @@ acknowledged data and continuing writes, and requires fresh replica identities
 and native full membership before the next fault. Host inspection gates progress
 with the same test-only acknowledgement; ordinary driver workload RBAC remains
 read-only.
+
+The planned-switchover journey optimistically patches `status.targetPrimaryNodeId`
+to an original Secondary, without changing spec, Pods or node configurations.
+It waits for the operator's native-completed Primary and exact original Pod UID
+selector, verifies acknowledged data and continued writes through the ClusterIP,
+and verifies that a direct write to the old Primary is rejected as `NotPrimary`.
+Every original Pod UID/container lifetime is retained. The host correlates
+final native deletion and positive cleanup with that same cohort and new
+Primary. Repeated/reverse transfer and recovery overlaps are not qualified.
 
 The copy-held Secondary repair variant uses a separate qualification package:
 a startup wrapper enables the sample's existing copy barrier before the fresh

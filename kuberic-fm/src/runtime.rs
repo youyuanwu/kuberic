@@ -2,9 +2,18 @@ use std::{future::Future, time::Duration};
 
 use anyhow::{bail, ensure, Context, Result};
 use fube_node::control::wire::{self, Link};
-use tokio::{net::TcpListener, time::Instant};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+    time::Instant,
+};
 
 use crate::{Config, Phase, State, Status};
+
+pub struct SwitchoverRequest {
+    pub target_node_id: String,
+    pub accepted: oneshot::Sender<Result<()>>,
+}
 
 fn publish(
     state: &State,
@@ -27,7 +36,16 @@ pub async fn run(
     shutdown: impl Future<Output = Result<()>>,
     observe: impl FnMut(&Status) -> Result<()>,
 ) -> Result<()> {
-    run_guarded(config, listener, shutdown, std::future::pending(), observe).await
+    let (_, requests) = mpsc::channel(1);
+    run_guarded(
+        config,
+        listener,
+        shutdown,
+        std::future::pending(),
+        requests,
+        observe,
+    )
+    .await
 }
 
 /// Invalidation stops new FM intent and withdraws publication. It does not
@@ -37,6 +55,7 @@ pub async fn run_guarded(
     listener: TcpListener,
     shutdown: impl Future<Output = Result<()>>,
     invalidated: impl Future<Output = String>,
+    requests: mpsc::Receiver<SwitchoverRequest>,
     mut observe: impl FnMut(&Status) -> Result<()>,
 ) -> Result<()> {
     config.validate()?;
@@ -55,7 +74,7 @@ pub async fn run_guarded(
             result = drive(
                 &config,
                 listener,
-                shutdown,
+                (shutdown, requests),
                 &mut state,
                 &mut links,
                 &mut previous,
@@ -87,13 +106,17 @@ pub async fn run_guarded(
 async fn drive(
     config: &Config,
     listener: TcpListener,
-    shutdown: impl Future<Output = Result<()>>,
+    control: (
+        impl Future<Output = Result<()>>,
+        mpsc::Receiver<SwitchoverRequest>,
+    ),
     state: &mut State,
     links: &mut [Option<Link>],
     previous: &mut Option<Status>,
     observe: &mut impl FnMut(&Status) -> Result<()>,
 ) -> Result<()> {
     let started = Instant::now();
+    let (shutdown, mut requests) = control;
     let mut stopping = false;
     let mut admitted = [false; 3];
     tokio::pin!(shutdown);
@@ -111,6 +134,12 @@ async fn drive(
             return Ok(());
         }
         tokio::select! {
+            Some(request) = requests.recv(), if !stopping => {
+                let result = state.request_switchover(&request.target_node_id, started.elapsed());
+                publish(state, previous, observe)?;
+                request.accepted.send(result)
+                    .map_err(|_| anyhow::anyhow!("switchover request owner dropped before acceptance"))?;
+            }
             result = &mut shutdown, if !stopping => {
                 result?;
                 state.request_shutdown(started.elapsed())?;

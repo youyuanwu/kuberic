@@ -19,6 +19,7 @@ pub enum Phase {
     Building,
     Configuring,
     Reconfiguring,
+    Switching,
     Restoring,
     Serving,
     Deleting,
@@ -38,6 +39,14 @@ pub struct Status {
     pub replication_endpoint: Option<String>,
     pub error: Option<String>,
     pub restoring_node_id: Option<String>,
+    pub switchover: Option<Switchover>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Switchover {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub completed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +64,7 @@ enum Operation {
     RepairDelete(usize),
     RepairBuild(usize),
     RepairConfigure,
+    Switchover(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +108,7 @@ pub struct State {
     retired_losses: VecDeque<(usize, ReplicaUp)>,
     identities: Vec<(i64, i64)>,
     repair: Option<Repair>,
+    switchover: Option<Switchover>,
     pending: Option<Pending>,
     completed: VecDeque<Completion>,
     deleting: [bool; 3],
@@ -161,6 +172,7 @@ impl State {
             retired_losses: VecDeque::new(),
             identities,
             repair: None,
+            switchover: None,
             pending: None,
             completed: VecDeque::new(),
             deleting: [false; 3],
@@ -183,6 +195,8 @@ impl State {
             } else {
                 Phase::Deleting
             }
+        } else if self.switchover.as_ref().is_some_and(|swap| !swap.completed) {
+            Phase::Switching
         } else if matches!(self.reconfiguration, Some(Reconfiguration::Failover(_))) {
             Phase::Reconfiguring
         } else if self.reconfiguration.is_some() || self.repair.is_some() {
@@ -233,6 +247,7 @@ impl State {
                     _ => None,
                 })
                 .map(|node| self.config.nodes[node].identity.id.clone()),
+            switchover: self.switchover.clone(),
         }
     }
 
@@ -330,6 +345,23 @@ impl State {
                 Operation::Delete(node),
                 node,
                 delete_replica_message(&request, &generation)?,
+            )
+        } else if let Some(swap) = self.switchover.as_ref().filter(|swap| !swap.completed) {
+            let target = self
+                .config
+                .nodes
+                .iter()
+                .position(|node| node.identity.id == swap.target_node_id)
+                .context("missing retained switchover target")?;
+            (
+                Operation::Switchover(target),
+                self.primary,
+                do_reconfiguration_message(
+                    self.configuration
+                        .as_ref()
+                        .context("missing switchover intent")?,
+                    &generation,
+                )?,
             )
         } else if let Some(reconfiguration) = self.reconfiguration {
             let destination = match reconfiguration {
@@ -684,11 +716,56 @@ impl State {
             .pending
             .as_ref()
             .context("unsolicited native completion")?;
+        let source = match pending.operation {
+            Operation::Switchover(target) => target,
+            _ => pending.outbound.node,
+        };
         ensure!(
-            node == pending.outbound.node,
+            node == source,
             "completion came from the wrong original channel"
         );
         match (pending.operation, action) {
+            (Operation::Switchover(target), "DoReconfigurationReply") => {
+                let (reply, owner) = decode_do_reconfiguration_reply(message)?;
+                let request = &self
+                    .configuration
+                    .as_ref()
+                    .context("missing frozen switchover")?
+                    .configuration;
+                let mut expected = request.clone();
+                expected.unit.previous = Epoch::default();
+                for replica in &mut expected.replicas.0 {
+                    replica.previous_role = 1;
+                }
+                ensure!(
+                    owner == Owner::Fm
+                        && reply.error == 0
+                        && reply.unit == expected.unit
+                        && reply.replicas.0.len() == 3
+                        && expected.replicas.0.iter().all(|replica| {
+                            reply.replicas.0.iter().filter(|actual| {
+                                let mut normalized = (*actual).clone();
+                                normalized.first_lsn = replica.first_lsn;
+                                normalized.last_lsn = replica.last_lsn;
+                                normalized.service_endpoint = replica.service_endpoint.clone();
+                                normalized == *replica
+                                    && if actual.current_role == 4 {
+                                        !actual.service_endpoint.is_empty()
+                                    } else {
+                                        actual.service_endpoint.is_empty()
+                                    }
+                            }).count() == 1
+                        }),
+                    "switchover completion changed the frozen epoch, identities, roles or endpoints, or failed with native error {}",
+                    reply.error
+                );
+                self.primary = target;
+                self.configured = Some(reply);
+                self.switchover
+                    .as_mut()
+                    .context("missing accepted switchover")?
+                    .completed = true;
+            }
             (Operation::RepairBuild(target), "AddReplicaReply") => {
                 let (reply, owner) = decode_add_replica_reply(message)?;
                 let repair = self.repair.as_mut().context("missing retained repair")?;
@@ -891,6 +968,10 @@ impl State {
 
     fn app_host_lost(&mut self, node: usize, report: &ReplicaUp) -> Result<()> {
         ensure!(
+            self.switchover.is_none(),
+            "application loss during or after planned switchover is not qualified"
+        );
+        ensure!(
             self.phase() == Phase::Serving && self.pending.is_none(),
             "only verified Serving application loss admits repair; bootstrap and interrupted reconfiguration are unsupported"
         );
@@ -1051,6 +1132,84 @@ impl State {
             state: 3,
             ..Replica::default()
         })
+    }
+
+    pub fn request_switchover(&mut self, target_node_id: &str, now: Duration) -> Result<()> {
+        self.healthy()?;
+        if let Some(swap) = &self.switchover {
+            ensure!(
+                swap.target_node_id == target_node_id,
+                "switchover cancellation, retargeting and repeated handoff are unsupported"
+            );
+            return Ok(());
+        }
+        ensure!(
+            self.phase() == Phase::Serving && self.pending.is_none(),
+            "switchover requires healthy completed Serving membership"
+        );
+        let target = self
+            .config
+            .nodes
+            .iter()
+            .position(|node| node.identity.id == target_node_id)
+            .context("switchover target is not an original node")?;
+        ensure!(
+            target != self.primary,
+            "switchover target is already Primary"
+        );
+        let completed = self
+            .configured
+            .as_ref()
+            .context("missing admitted membership")?;
+        ensure!(
+            completed.unit.previous == Epoch::default()
+                && completed.unit.current.data_loss == self.initial.unit.current.data_loss
+                && completed.unit.current.configuration
+                    == self.initial.unit.current.configuration + 1
+                && completed.replicas.0.len() == 3
+                && completed
+                    .replicas
+                    .0
+                    .iter()
+                    .all(|r| r.up && r.state == 2 && matches!(r.current_role, 3 | 4))
+                && self.losses.iter().all(Option::is_none)
+                && self.retired_losses.is_empty(),
+            "switchover after repair or another configuration round is not qualified"
+        );
+        let mut configuration = Configuration {
+            unit: completed.unit.clone(),
+            service: self.initial.service.clone(),
+            replicas: completed.replicas.clone(),
+        };
+        configuration.unit.previous = configuration.unit.current;
+        configuration.unit.current.configuration = configuration
+            .unit
+            .current
+            .configuration
+            .checked_add(0x1_0000_0001)
+            .context("switchover epoch overflow")?;
+        let target_node = self.config.nodes[target]
+            .identity
+            .native()
+            .map_err(anyhow::Error::msg)?;
+        for replica in &mut configuration.replicas.0 {
+            replica.previous_role = replica.current_role;
+            replica.current_role = if replica.node == target_node { 4 } else { 3 };
+            replica.service_endpoint.clear();
+            replica.first_lsn = -1;
+            replica.last_lsn = -1;
+        }
+        self.clock(now)?;
+        self.configuration = Some(DoReconfiguration {
+            configuration,
+            phase0_duration: i64::MAX,
+        });
+        self.switchover = Some(Switchover {
+            source_node_id: self.config.nodes[self.primary].identity.id.clone(),
+            target_node_id: target_node_id.into(),
+            completed: false,
+        });
+        Ok(())
     }
 
     pub fn request_shutdown(&mut self, now: Duration) -> Result<()> {
