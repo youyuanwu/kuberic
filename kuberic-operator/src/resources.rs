@@ -175,6 +175,8 @@ pub fn runner_config(cohort: &FrozenCohort, index: usize) -> Result<fube_node_ru
             .map(|(_, peer)| peer.clone())
             .collect(),
         partition: allocation.partition.clone(),
+        target: 3,
+        minimum: 2,
         package: PathBuf::from(&allocation.spec.package_path),
         application: allocation.spec.service.application.clone(),
         package_version_instance: allocation.spec.service.package_version_instance,
