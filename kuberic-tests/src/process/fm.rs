@@ -56,6 +56,8 @@ impl Cluster {
                     .map(|(_, peer)| peer.clone())
                     .collect(),
                 partition: config.partition.clone(),
+                target: 3,
+                minimum: 2,
                 package: package.clone(),
                 application: config.service.application.clone(),
                 package_version_instance: config.service.package_version_instance,
