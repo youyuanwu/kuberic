@@ -8,6 +8,417 @@ use kuberic_fm::{Phase, State};
 
 use support::*;
 
+fn start_failover(state: &mut State, config: &kuberic_fm::Config) -> kuberic_fm::Outbound {
+    let replies = serving(state);
+    let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+    state
+        .observe(
+            1,
+            &replica_up_message(&current_app_host_loss(config, &committed, 1), Owner::Fm).unwrap(),
+        )
+        .unwrap();
+    state.reconcile(Duration::ZERO).unwrap().pop().unwrap()
+}
+
+#[test]
+fn candidate_redirection_retains_pc_and_requires_new_candidate_completion_before_repair_and_handoff(
+) {
+    for handoff in [false, true] {
+        let config = config();
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let replies = serving(&mut state);
+        let mut committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+        if handoff {
+            state
+                .request_switchover("1", committed.unit.current.configuration, Duration::ZERO)
+                .unwrap();
+            let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            let reply = completion(&command.message);
+            state.observe(0, &reply).unwrap();
+            committed = decode_do_reconfiguration_reply(&reply).unwrap().0;
+        }
+        let lost = if handoff { 0 } else { 1 };
+        state
+            .observe(
+                lost,
+                &replica_up_message(&current_app_host_loss(&config, &committed, lost), Owner::Fm)
+                    .unwrap(),
+            )
+            .unwrap();
+        let initial = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        let intent = decode_do_reconfiguration(&initial.message).unwrap().0;
+        let selected = 2;
+        let report = change_configuration_message(
+            &candidate_change(&intent, &config.nodes[selected].identity.native().unwrap()),
+            Owner::Fm,
+        )
+        .unwrap();
+        let ack = state.observe(initial.node, &report).unwrap().unwrap();
+        let (ack_body, generation) = decode_change_configuration_reply(&ack).unwrap();
+        assert_eq!(generation, config.generation().unwrap());
+        assert_eq!(ack_body.unit.previous, intent.configuration.unit.previous);
+        assert_eq!(
+            ack_body.unit.current.configuration,
+            intent.configuration.unit.current.configuration + 0x1_0000_0001
+        );
+        assert_eq!(state.phase(), Phase::Reconfiguring);
+        assert_eq!(
+            state.status().configuration_epoch,
+            Some(committed.unit.current.configuration)
+        );
+        assert_eq!(
+            state.status().primary_node_id,
+            config.nodes[lost].identity.id
+        );
+        assert!(state.status().service_endpoint.is_none());
+        let redirected = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        assert_eq!(redirected.node, selected);
+        let next = decode_do_reconfiguration(&redirected.message).unwrap().0;
+        assert_eq!(next.configuration.unit, ack_body.unit);
+        assert_eq!(
+            next.configuration.unit.current.data_loss,
+            committed.unit.current.data_loss
+        );
+        for replica in &next.configuration.replicas.0 {
+            let before = intent
+                .configuration
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.node == replica.node)
+                .unwrap();
+            let mut expected = before.clone();
+            if expected.current_role == 4 {
+                expected.current_role = 3;
+            }
+            if expected.node == config.nodes[selected].identity.native().unwrap() {
+                expected.current_role = 4;
+            }
+            assert_eq!(replica, &expected);
+            assert_eq!((replica.first_lsn, replica.last_lsn), (-1, -1));
+        }
+        let replay = state.observe(initial.node, &report).unwrap().unwrap();
+        assert_eq!(replay, ack);
+        state
+            .observe(initial.node, &completion(&initial.message))
+            .unwrap();
+        let old_reply = completed_configuration(&intent);
+        let endpoint = AddInstance {
+            unit: intent.configuration.unit.clone(),
+            service: intent.configuration.service.clone(),
+            replica: old_reply
+                .replicas
+                .0
+                .iter()
+                .find(|r| r.current_role == 4)
+                .unwrap()
+                .clone(),
+        };
+        assert!(state
+            .observe(
+                initial.node,
+                &replica_endpoint_updated_message(&endpoint, Owner::Fm).unwrap()
+            )
+            .unwrap()
+            .is_some());
+        assert!(state.status().service_endpoint.is_none());
+        assert_eq!(
+            state.reconcile(Duration::from_millis(100)).unwrap(),
+            vec![redirected.clone()]
+        );
+        state
+            .observe(selected, &completion(&redirected.message))
+            .unwrap();
+        assert_eq!(state.phase(), Phase::Restoring);
+        assert_eq!(
+            state.status().primary_node_id,
+            config.nodes[selected].identity.id
+        );
+        let replies = restore(&mut state, Duration::from_millis(100));
+        let repaired = decode_do_reconfiguration_reply(&replies[2].1).unwrap().0;
+        state.observe(initial.node, &report).unwrap();
+        state
+            .observe(initial.node, &completion(&initial.message))
+            .unwrap();
+        assert_eq!(state.phase(), Phase::Serving);
+        let fresh = repaired
+            .replicas
+            .0
+            .iter()
+            .find(|r| r.node == config.nodes[lost].identity.native().unwrap())
+            .unwrap();
+        assert!(fresh.id > config.nodes[lost].replica_id);
+        state
+            .request_switchover(
+                &config.nodes[lost].identity.id,
+                repaired.unit.current.configuration,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        let command = state
+            .reconcile(Duration::from_millis(100))
+            .unwrap()
+            .pop()
+            .unwrap();
+        state.observe(lost, &completion(&command.message)).unwrap();
+        state.request_shutdown(Duration::from_millis(100)).unwrap();
+        let mut deleted = Vec::new();
+        for _ in 0..3 {
+            let command = state
+                .reconcile(Duration::from_millis(100))
+                .unwrap()
+                .pop()
+                .unwrap();
+            state
+                .observe(command.node, &completion(&command.message))
+                .unwrap();
+            deleted.push(command.node);
+        }
+        assert_eq!(deleted.last(), Some(&lost));
+        for node in 0..3 {
+            state.disconnected(node).unwrap();
+        }
+        assert_eq!(state.phase(), Phase::Stopped);
+    }
+}
+
+#[test]
+fn candidate_change_rejects_changed_authority_and_ambiguous_or_ineligible_progress() {
+    let config = config();
+    for fault in 0..18 {
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let command = start_failover(&mut state, &config);
+        let intent = decode_do_reconfiguration(&command.message).unwrap().0;
+        let mut report = candidate_change(&intent, &config.nodes[2].identity.native().unwrap());
+        let selected = report
+            .replicas
+            .0
+            .iter()
+            .position(|r| r.last_lsn >= 0)
+            .unwrap();
+        let mut source = command.node;
+        let mut owner = Owner::Fm;
+        match fault {
+            0 => source = 2,
+            1 => report.unit.current.configuration += 1,
+            2 => report.unit.previous.configuration += 1,
+            3 => report.unit.current.data_loss += 1,
+            4 => report.unit.minimum = 1,
+            5 => report.service.update_version += 1,
+            6 => report.replicas.0[selected].instance += 1,
+            7 => report.replicas.0[0] = report.replicas.0[selected].clone(),
+            8 => report.replicas.0[selected]
+                .replication_endpoint
+                .push_str("/changed"),
+            9 => report.replicas.0[selected].service_endpoint = "unconfirmed-writer".into(),
+            10 => report.replicas.0[selected].current_role = 4,
+            11 => report.replicas.0[selected].up = false,
+            12 => report.replicas.0[selected].state = 1,
+            13 => report.replicas.0[selected].first_lsn = -1,
+            14 => {
+                for r in &mut report.replicas.0 {
+                    r.first_lsn = -1;
+                    r.last_lsn = -1;
+                }
+            }
+            15 => {
+                report.replicas.0[0].first_lsn = 1;
+                report.replicas.0[0].last_lsn = 99;
+            }
+            16 => report.replicas.0[0].first_lsn = 1,
+            _ => owner = Owner::Fmm,
+        }
+        assert!(
+            state
+                .observe(
+                    source,
+                    &change_configuration_message(&report, owner).unwrap()
+                )
+                .is_err(),
+            "fault {fault}"
+        );
+        assert_eq!(state.phase(), Phase::ControlUnknown);
+        assert!(state.status().service_endpoint.is_none());
+    }
+}
+
+#[test]
+fn redirected_completion_never_accepts_a_new_epoch_reply_from_the_old_candidate() {
+    let config = config();
+    let mut state = State::new(config.clone()).unwrap();
+    bootstrap(&mut state, &config);
+    let original = start_failover(&mut state, &config);
+    let request = decode_do_reconfiguration(&original.message).unwrap().0;
+    state
+        .observe(
+            original.node,
+            &change_configuration_message(
+                &candidate_change(&request, &config.nodes[2].identity.native().unwrap()),
+                Owner::Fm,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let redirected = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+    assert!(state
+        .observe(original.node, &completion(&redirected.message))
+        .is_err());
+    assert_eq!(state.phase(), Phase::ControlUnknown);
+    assert!(state.status().service_endpoint.is_none());
+}
+
+#[test]
+fn redirection_budget_and_replica_admission_follow_each_new_repaired_failover() {
+    let config = config();
+    let mut state = State::new(config.clone()).unwrap();
+    bootstrap(&mut state, &config);
+    let replies = serving(&mut state);
+    let mut committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+    for _ in 0..35 {
+        let lost = config
+            .nodes
+            .iter()
+            .position(|node| node.identity.id == state.status().primary_node_id)
+            .unwrap();
+        state
+            .observe(
+                lost,
+                &replica_up_message(&current_app_host_loss(&config, &committed, lost), Owner::Fm)
+                    .unwrap(),
+            )
+            .unwrap();
+        let original = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        let selected = (0..3)
+            .find(|node| *node != lost && *node != original.node)
+            .unwrap();
+        let request = decode_do_reconfiguration(&original.message).unwrap().0;
+        state
+            .observe(
+                original.node,
+                &change_configuration_message(
+                    &candidate_change(&request, &config.nodes[selected].identity.native().unwrap()),
+                    Owner::Fm,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let redirected = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        assert_eq!(redirected.node, selected);
+        state
+            .observe(selected, &completion(&redirected.message))
+            .unwrap();
+        let restored = restore(&mut state, Duration::ZERO);
+        committed = decode_do_reconfiguration_reply(&restored[2].1).unwrap().0;
+        assert_eq!(
+            state.status().primary_node_id,
+            config.nodes[selected].identity.id
+        );
+    }
+}
+
+#[test]
+fn candidate_redirection_duplicates_preserve_deadlines_and_new_rounds_are_bounded() {
+    let config = config();
+    for exhaust in [false, true] {
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let mut command = start_failover(&mut state, &config);
+        let mut retained = None;
+        for round in 0..=config.nodes.len() {
+            let intent = decode_do_reconfiguration(&command.message).unwrap().0;
+            let selected = if command.node == 0 { 2 } else { 0 };
+            let report = change_configuration_message(
+                &candidate_change(&intent, &config.nodes[selected].identity.native().unwrap()),
+                Owner::Fm,
+            )
+            .unwrap();
+            let source = command.node;
+            let result = state.observe(source, &report);
+            if exhaust && round == config.nodes.len() {
+                assert!(result.unwrap_err().to_string().contains("budget exhausted"));
+                break;
+            }
+            let next = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            let ack = result.unwrap().unwrap();
+            assert_eq!(state.observe(source, &report).unwrap().unwrap(), ack);
+            command = next;
+            if !exhaust {
+                retained = Some((source, report));
+                break;
+            }
+        }
+        if let Some((source, report)) = retained {
+            for now in (100..config.operation_timeout_ms).step_by(100) {
+                state.observe(source, &report).unwrap();
+                assert_eq!(
+                    state.reconcile(Duration::from_millis(now)).unwrap(),
+                    vec![command.clone()]
+                );
+            }
+            assert!(state
+                .reconcile(Duration::from_millis(config.operation_timeout_ms))
+                .is_err());
+        }
+        assert_eq!(state.phase(), Phase::ControlUnknown);
+        assert!(state.status().service_endpoint.is_none());
+    }
+}
+
+#[test]
+fn candidate_change_is_not_admitted_outside_an_issued_primary_failover() {
+    for phase in 0..4 {
+        let config = config();
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let replies = serving(&mut state);
+        let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+        let mut request = DoReconfiguration {
+            configuration: Configuration {
+                unit: committed.unit.clone(),
+                service: config.service.native(),
+                replicas: committed.replicas.clone(),
+            },
+            phase0_duration: i64::MAX,
+        };
+        let mut source = 0;
+        if phase == 1 {
+            state
+                .request_switchover("1", committed.unit.current.configuration, Duration::ZERO)
+                .unwrap();
+            let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            source = command.node;
+            request = decode_do_reconfiguration(&command.message).unwrap().0;
+        } else if phase >= 2 {
+            let lost = if phase == 2 { 0 } else { 1 };
+            state
+                .observe(
+                    lost,
+                    &replica_up_message(
+                        &current_app_host_loss(&config, &committed, lost),
+                        Owner::Fm,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            if phase == 2 {
+                let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+                source = command.node;
+                request = decode_do_reconfiguration(&command.message).unwrap().0;
+            }
+        }
+        let report = change_configuration_message(
+            &candidate_change(&request, &config.nodes[2].identity.native().unwrap()),
+            Owner::Fm,
+        )
+        .unwrap();
+        assert!(state.observe(source, &report).is_err(), "phase {phase}");
+        assert_eq!(state.phase(), Phase::ControlUnknown);
+        assert!(state.status().service_endpoint.is_none());
+    }
+}
+
 #[test]
 fn planned_switchover_retries_old_primary_and_only_accepts_final_candidate_completion() {
     for candidate in [0, 2] {

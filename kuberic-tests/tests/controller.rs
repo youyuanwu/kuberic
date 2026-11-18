@@ -18,6 +18,80 @@ use kuberic_operator::{
 
 use support::{api::Kind, Fixture, NAME, NAMESPACE};
 
+#[tokio::test]
+async fn scripted_candidate_redirection_routes_only_final_native_primary_and_composes_with_repair()
+{
+    use fube_ra::protocol::*;
+
+    let fixture = Fixture::new().await;
+    fixture.serving().await;
+    let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+    fixture.fm.lose_primary().await;
+    fixture.drive().await;
+    assert_disabled(&fixture).await;
+    let original = fixture.fm.command().await;
+    assert_eq!(original.node, 0);
+    let intent = decode_do_reconfiguration(&original.message).unwrap().0;
+    let report = change_configuration_message(
+        &kuberic_tests::fm::candidate_change(
+            &intent,
+            &cohort.fm_config().unwrap().nodes[2]
+                .identity
+                .native()
+                .unwrap(),
+        ),
+        Owner::Fm,
+    )
+    .unwrap();
+    let acknowledgement = fixture.fm.deliver(original.node, &report).await.unwrap();
+    fixture.drive().await;
+    assert_disabled(&fixture).await;
+    let redirected = fixture.fm.command().await;
+    assert_eq!(redirected.node, 2);
+    assert_eq!(
+        fixture.fm.deliver(original.node, &report).await.unwrap(),
+        acknowledgement
+    );
+    fixture
+        .fm
+        .deliver(
+            original.node,
+            &support::native_completion(&original.message),
+        )
+        .await;
+    fixture.drive().await;
+    assert_disabled(&fixture).await;
+    let pending = fixture.set().await.status.unwrap();
+    assert_eq!(pending.phase, ControllerPhase::Reconfiguring);
+    assert!(pending.primary_node_id.is_none());
+    fixture.fm.complete(&redirected).await;
+    fixture.fm.restore().await;
+    fixture.drive().await;
+    let repaired = fixture.set().await.status.unwrap();
+    assert_eq!(repaired.cohort().as_ref(), Some(&cohort));
+    assert_eq!(
+        repaired.primary_node_id.as_ref(),
+        Some(&cohort.allocation.nodes[2].node_id)
+    );
+    assert_eq!(repaired.target_primary_node_id, repaired.primary_node_id);
+    assert_eq!(
+        selector(&fixture).await.unwrap().get(POD_UID),
+        Some(&cohort.bindings[2].pod_uid)
+    );
+    request_switchover(&fixture, Some(cohort.allocation.nodes[1].node_id.clone())).await;
+    fixture.drive().await;
+    assert_disabled(&fixture).await;
+    let handoff = fixture.fm.command().await;
+    fixture.fm.complete(&handoff).await;
+    fixture.drive().await;
+    assert_eq!(
+        fixture.set().await.status.unwrap().primary_node_id.as_ref(),
+        Some(&cohort.allocation.nodes[1].node_id)
+    );
+    assert_eq!(fixture.fm.starts.load(Ordering::SeqCst), 1);
+    fixture.api.check();
+}
+
 async fn selector(fixture: &Fixture) -> Option<BTreeMap<String, String>> {
     Api::<Service>::namespaced(fixture.client.clone(), NAMESPACE)
         .get(&resources::write_service_name(NAME))

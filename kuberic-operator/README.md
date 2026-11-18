@@ -126,6 +126,20 @@ owned zombie until original-host retirement;
 normal native deletion and validated physical cleanup are still required for
 every original Node before finalizer release.
 
+Native `ChangeConfiguration` may redirect an issued Primary-crash failover.
+The FM accepts only the current candidate's exact membership/epoch report and
+one live Ready Secondary recommendation, then retains PC, advances the
+configuration epoch and issues new native reconfiguration. During every round
+the set stays `reconfiguring` and unrouted; only the selected candidate's final
+successful completion authorizes its Primary endpoint and Pod UID. Exact
+report replay does not advance another epoch or extend the current deadline.
+No new status request, spec field or placement policy is introduced.
+
+This handler is qualified with scripted state/controller and native-Channel
+tests, including fresh repair and later handoff/teardown. Genuine responsive
+unequal-progress RA-triggered redirection is not yet qualified. Existing
+real-process failover coverage is not evidence for that separate branch.
+
 ## Restoring redundancy
 
 After failover the FM normally deletes the exact predecessor, then builds a

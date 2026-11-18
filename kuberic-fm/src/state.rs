@@ -89,6 +89,13 @@ struct Completion {
     body: Vec<u8>,
 }
 
+struct CandidateChange {
+    node: usize,
+    report: Configuration,
+    request: DoReconfiguration,
+    reply: FailoverUnitReply,
+}
+
 struct Repair {
     node: usize,
     target: Replica,
@@ -114,6 +121,7 @@ pub struct State {
     switchover: Option<Switchover>,
     pending: Option<Pending>,
     completed: VecDeque<Completion>,
+    candidate_changes: VecDeque<CandidateChange>,
     deleting: [bool; 3],
     deleted: [bool; 3],
     disconnected: [bool; 3],
@@ -178,6 +186,7 @@ impl State {
             switchover: None,
             pending: None,
             completed: VecDeque::new(),
+            candidate_changes: VecDeque::new(),
             deleting: [false; 3],
             deleted: [false; 3],
             disconnected: [false; 3],
@@ -678,7 +687,11 @@ impl State {
                             || self
                                 .configured
                                 .as_ref()
-                                .is_some_and(|reply| reply.unit == body.unit)),
+                                .is_some_and(|reply| reply.unit == body.unit)
+                            || self
+                                .candidate_changes
+                                .iter()
+                                .any(|change| { change.request.configuration.unit == body.unit })),
                     "endpoint report does not match the original service/epoch"
                 );
                 Some(replica_endpoint_updated_reply_message(
@@ -690,6 +703,12 @@ impl State {
                     &generation,
                 )?)
             }
+            "ChangeConfiguration" => {
+                let (body, owner) = decode_change_configuration(message)?;
+                ensure!(owner == Owner::Fm, "foreign candidate-change owner");
+                let reply = self.change_configuration(node, body)?;
+                Some(change_configuration_reply_message(&reply, &generation)?)
+            }
             "AddPrimaryReply"
             | "AddReplicaReply"
             | "DoReconfigurationReply"
@@ -700,6 +719,16 @@ impl State {
                         && completed.body == message.body
                 }) {
                     return Ok(None);
+                }
+                if action == "DoReconfigurationReply" {
+                    let (reply, owner) = decode_do_reconfiguration_reply(message)?;
+                    ensure!(owner == Owner::Fm, "foreign configuration completion owner");
+                    if self.candidate_changes.iter().any(|change| {
+                        change.node == node
+                            && Self::loss_completion_matches(&reply, &change.request.configuration)
+                    }) {
+                        return Ok(None);
+                    }
                 }
                 self.complete(node, action, message)?;
                 if self.completed.len() == REPLAY_HISTORY {
@@ -716,6 +745,181 @@ impl State {
             _ => bail!("unsupported external-FM action: {action}"),
         };
         Ok(response)
+    }
+
+    fn change_configuration(
+        &mut self,
+        node: usize,
+        report: Configuration,
+    ) -> Result<FailoverUnitReply> {
+        if let Some(previous) = self
+            .candidate_changes
+            .iter()
+            .find(|change| change.node == node && change.report == report)
+        {
+            return Ok(previous.reply.clone());
+        }
+        let Some(Reconfiguration::Failover(candidate)) = self.reconfiguration else {
+            bail!("candidate change requires an active Primary failover");
+        };
+        let pending = self
+            .pending
+            .as_ref()
+            .context("unsolicited candidate change")?;
+        ensure!(
+            self.phase() == Phase::Reconfiguring
+                && node == candidate
+                && pending.outbound.node == candidate
+                && matches!(pending.operation, Operation::Configure)
+                && pending.sent.is_some(),
+            "candidate change came from the wrong original channel or operation"
+        );
+        let request = self
+            .configuration
+            .as_ref()
+            .context("missing failover intent")?;
+        ensure!(
+            report.unit == request.configuration.unit
+                && report.service == request.configuration.service
+                && report.replicas.0.len() == request.configuration.replicas.0.len(),
+            "candidate change altered the frozen partition, epoch, service or membership"
+        );
+        let mut selected = None;
+        for expected in &request.configuration.replicas.0 {
+            let mut matching = report.replicas.0.iter().filter(|r| r.node == expected.node);
+            let actual = matching
+                .next()
+                .context("candidate change omitted an original member")?;
+            let mut normalized = actual.clone();
+            normalized.first_lsn = expected.first_lsn;
+            normalized.last_lsn = expected.last_lsn;
+            ensure!(
+                matching.next().is_none() && normalized == *expected,
+                "candidate change altered replica identity, roles, state or endpoints"
+            );
+            if actual.last_lsn >= 0 {
+                ensure!(
+                    selected.is_none()
+                        && actual.first_lsn >= 0
+                        && actual.current_role == 3
+                        && actual.up
+                        && actual.state == 2,
+                    "candidate change must recommend exactly one live Ready Secondary"
+                );
+                selected = self.config.nodes.iter().position(|placement| {
+                    placement
+                        .identity
+                        .native()
+                        .expect("validated node identity")
+                        == actual.node
+                });
+            } else {
+                ensure!(
+                    actual.first_lsn == -1 && actual.last_lsn == -1,
+                    "candidate change exposed progress for a nonselected member"
+                );
+            }
+        }
+        let selected = selected.context("candidate change omitted its selected Secondary")?;
+        ensure!(
+            self.candidate_changes
+                .iter()
+                .filter(|change| {
+                    change.request.configuration.unit.previous
+                        == request.configuration.unit.previous
+                })
+                .count()
+                < self.config.nodes.len(),
+            "native failover candidate redirection budget exhausted"
+        );
+        let mut next = request.clone();
+        next.configuration.unit.current.configuration = next
+            .configuration
+            .unit
+            .current
+            .configuration
+            .checked_add(0x1_0000_0001)
+            .context("candidate redirection epoch overflow")?;
+        let selected_node = self.config.nodes[selected]
+            .identity
+            .native()
+            .map_err(anyhow::Error::msg)?;
+        for replica in &mut next.configuration.replicas.0 {
+            if replica.current_role == 4 {
+                replica.current_role = 3;
+            }
+            if replica.node == selected_node {
+                replica.current_role = 4;
+            }
+            replica.first_lsn = -1;
+            replica.last_lsn = -1;
+        }
+        let reply = FailoverUnitReply {
+            unit: next.configuration.unit.clone(),
+            error: 0,
+        };
+        let outbound = Outbound {
+            node: selected,
+            message: do_reconfiguration_message(&next, &self.config.generation()?)?,
+        };
+        let previous = request.clone();
+        self.configuration = Some(next);
+        self.reconfiguration = Some(Reconfiguration::Failover(selected));
+        self.pending = Some(Pending {
+            operation: Operation::Configure,
+            outbound,
+            started: self.now,
+            sent: None,
+        });
+        if self.candidate_changes.len() == REPLAY_HISTORY {
+            self.candidate_changes.pop_front();
+        }
+        self.candidate_changes.push_back(CandidateChange {
+            node,
+            report,
+            request: previous,
+            reply: reply.clone(),
+        });
+        Ok(reply)
+    }
+
+    fn loss_completion_matches(reply: &ConfigurationReply, request: &Configuration) -> bool {
+        let mut unit = request.unit.clone();
+        unit.previous = Epoch::default();
+        let survivors: Vec<_> = request
+            .replicas
+            .0
+            .iter()
+            .filter(|replica| replica.current_role >= 3)
+            .collect();
+        reply.error == 0
+            && reply.unit == unit
+            && reply.replicas.0.len() == 2
+            && survivors.len() == 2
+            && survivors.iter().all(|replica| {
+                reply
+                    .replicas
+                    .0
+                    .iter()
+                    .filter(|actual| {
+                        actual.node == replica.node
+                            && actual.id == replica.id
+                            && actual.instance == replica.instance
+                            && actual.version == replica.version
+                            && actual.previous_role == 1
+                            && actual.current_role == replica.current_role
+                            && actual.state == 2
+                            && actual.up
+                            && !actual.replication_endpoint.is_empty()
+                            && if actual.current_role == 4 {
+                                !actual.service_endpoint.is_empty()
+                            } else {
+                                actual.service_endpoint.is_empty()
+                            }
+                    })
+                    .count()
+                    == 1
+            })
     }
 
     fn complete(&mut self, node: usize, action: &str, message: &Message) -> Result<()> {
@@ -861,26 +1065,7 @@ impl State {
                         .0
                         .retain(|replica| replica.current_role >= 3);
                     ensure!(
-                        reply.unit == expected.unit
-                            && reply.replicas.0.len() == 2
-                            && expected.replicas.0.iter().all(|replica| {
-                                reply.replicas.0.iter().filter(|actual| {
-                                    actual.node == replica.node
-                                        && actual.id == replica.id
-                                        && actual.instance == replica.instance
-                                        && actual.version == replica.version
-                                        && actual.previous_role == 1
-                                        && actual.current_role == replica.current_role
-                                        && actual.state == 2
-                                        && actual.up
-                                        && !actual.replication_endpoint.is_empty()
-                                        && if actual.current_role == 4 {
-                                            !actual.service_endpoint.is_empty()
-                                        } else {
-                                            actual.service_endpoint.is_empty()
-                                        }
-                                }).count() == 1
-                            }),
+                        Self::loss_completion_matches(&reply, request),
                         "loss reconfiguration completion differs from the retained epoch, quorum or original membership"
                     );
                     match reconfiguration {

@@ -112,6 +112,18 @@ pub fn completed_configuration(request: &DoReconfiguration) -> ConfigurationRepl
     }
 }
 
+pub fn candidate_change(request: &DoReconfiguration, selected: &NodeInstance) -> Configuration {
+    let mut report = request.configuration.clone();
+    for replica in &mut report.replicas.0 {
+        (replica.first_lsn, replica.last_lsn) = if replica.node == *selected {
+            (1, 9)
+        } else {
+            (-1, -1)
+        };
+    }
+    report
+}
+
 pub fn app_host_loss(config: &Config, unit: &FailoverUnit, node: usize) -> ReplicaUp {
     let placement = &config.nodes[node];
     ReplicaUp {
