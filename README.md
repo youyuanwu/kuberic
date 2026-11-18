@@ -59,7 +59,9 @@ Real-process safety journeys also pause an owned Secondary before a
 quorum-acknowledged write, verify its lag from actual peer progress, and require
 explicit refusal when Primary loss cannot obtain native progress. This covers
 an unresponsive lagging survivor, not election among responsive divergent
-histories. Losing both Secondary applications cannot successfully complete a new client
+histories. Candidate-redirection tests inject native reports into the FM core
+and real native Channels; they do not prove that unequal runtime progress
+causes RA to emit those reports. Losing both Secondary applications cannot successfully complete a new client
 write, even through the live Primary's direct endpoint. Crashing a fresh
 replica while real copy or final native admission is held never restores
 Serving publication.
@@ -140,6 +142,34 @@ survivors' completed configuration. Every original replica still requires its
 actual normal deletion acknowledgement, and every original Node/application
 requires positive physical cleanup. A crashed application may remain an owned
 zombie until owned-host retirement; successful failover is not a reaping receipt.
+
+### Failover candidate redirection (scripted qualification)
+
+The FM handles native `ChangeConfiguration` from the exact nominated candidate
+during an issued Primary-crash failover. Shared RA owns GetLSN, separate PC/CC
+quorum checks and history-sensitive candidate selection; FM validates the frozen
+epoch, service, full membership, current incarnations, roles and endpoints.
+Only one live Ready Secondary may have initialized LSNs in that report.
+
+FM retains PC and the data-loss epoch, advances the Primary configuration epoch
+and sends a fresh `DoReconfiguration` to the recommended Secondary with unknown
+LSNs. That candidate must perform its own native progress/reconfiguration work.
+Neither the recommendation nor its legacy `ChangeConfigurationReply` publishes
+a Primary or completes the operation. The pinned fube adapter explicitly
+rejects/logs the deprecated reply; it is not a progress barrier.
+
+Exact accepted reports replay their retained reply without advancing epoch or
+resetting the current timeout. Superseded successful completions and endpoint
+notifications cannot finish a newer round. Redirection is bounded by the fixed
+original node count per failover, with separately bounded exact history; neither
+bound limits the number of completed repair/failover cycles. Changed/foreign
+reports, unavailable control and further application loss still fail closed.
+
+State, mock-controller and native-wire tests qualify report validation, retries,
+stale completion fencing, final-selected-candidate publication, fresh same-Pod
+repair, later handoff and deletion. They use scripted recommendations.
+**Genuine responsive unequal-progress RA-triggered redirection remains
+unqualified**; no sample apply barrier, fube code change or new CRD API is added.
 
 ### Replica restoration
 

@@ -152,6 +152,21 @@ impl ScriptedFm {
         }
     }
 
+    pub async fn deliver(
+        &self,
+        node: usize,
+        message: &fube_transport::message::Message,
+    ) -> Option<fube_transport::message::Message> {
+        self.session
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .state
+            .observe(node, message)
+            .unwrap()
+    }
+
     pub async fn lose_primary(&self) {
         let mut session = self.session.lock().await;
         let session = session.as_mut().unwrap();
