@@ -2,6 +2,7 @@ use kuberic_tests::fm as support;
 
 use std::time::Duration;
 
+use fube_node::control::wire;
 use fube_ra::protocol::*;
 use fubst::serde::ObjectArray;
 use kuberic_fm::{Phase, State};
@@ -99,7 +100,7 @@ fn candidate_redirection_retains_pc_and_requires_new_candidate_completion_before
             assert_eq!((replica.first_lsn, replica.last_lsn), (-1, -1));
         }
         let replay = state.observe(initial.node, &report).unwrap().unwrap();
-        assert_eq!(replay, ack);
+        assert_message_eq(&replay, &ack);
         state
             .observe(initial.node, &completion(&initial.message))
             .unwrap();
@@ -342,7 +343,7 @@ fn candidate_redirection_duplicates_preserve_deadlines_and_new_rounds_are_bounde
             }
             let next = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
             let ack = result.unwrap().unwrap();
-            assert_eq!(state.observe(source, &report).unwrap().unwrap(), ack);
+            assert_message_eq(&state.observe(source, &report).unwrap().unwrap(), &ack);
             command = next;
             if !exhaust {
                 retained = Some((source, report));
@@ -791,7 +792,7 @@ fn create_waits_for_semantic_replies_and_publishes_only_final_native_configurati
     for step in 0..4 {
         let now = Duration::from_millis(step * 2);
         let outgoing = state.reconcile(now).unwrap().pop().unwrap();
-        actions.push(outgoing.message.properties().unwrap().action);
+        actions.push(wire::action(&outgoing.message).unwrap());
         assert_eq!(
             outgoing.node, 1,
             "all create/build/configuration work targets the selected primary"
@@ -841,7 +842,19 @@ fn retry_is_exact_and_completed_duplicates_do_not_advance_the_next_operation() {
     let reply = completion(&original[0].message);
     state.observe(original[0].node, &reply).unwrap();
     let build = state.reconcile(Duration::from_millis(100)).unwrap();
-    state.observe(original[0].node, &reply).unwrap();
+    let split = reply.body().len() / 2;
+    let body = furpc::Body::from_segments(vec![
+        reply.body().slice(0..split).unwrap(),
+        reply.body().slice(split..reply.body().len()).unwrap(),
+    ])
+    .unwrap();
+    let mut duplicate = furpc::Message::builder().body(body);
+    for header in reply.headers().records() {
+        duplicate = duplicate.append_header(header.to_owned());
+    }
+    state
+        .observe(original[0].node, &duplicate.build().unwrap())
+        .unwrap();
     assert_eq!(state.phase(), Phase::Building);
     assert_eq!(state.reconcile(Duration::from_millis(200)).unwrap(), build);
     let (body, _) = decode_add_primary_reply(&reply).unwrap();
@@ -896,7 +909,14 @@ fn changed_generation_and_nonempty_bootstrap_inventory_are_not_recovery() {
         if generation_change {
             let mut generation = config.generation().unwrap();
             generation.number.generation += 1;
-            message.headers.push(generation.header().unwrap());
+            let mut builder = furpc::Message::builder().body(message.body().clone());
+            for header in message.headers().records() {
+                builder = builder.append_header(header.to_owned());
+            }
+            message = builder
+                .append_header(generation.header().unwrap())
+                .build()
+                .unwrap();
         } else {
             state.observe(0, &message).unwrap();
             let report = ReplicaUp {
@@ -947,7 +967,7 @@ fn type_notifications_are_acknowledged_but_are_not_a_placement_prerequisite() {
     let mut state = State::new(config.clone()).unwrap();
     bootstrap(&mut state, &config);
     let request = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
-    assert_eq!(request.message.properties().unwrap().action, "AddPrimary");
+    assert_eq!(wire::action(&request.message).unwrap(), "AddPrimary");
     let service = config.service.native();
     let body = ServiceTypeNotification {
         infos: ObjectArray(vec![ServiceTypeInfo {
@@ -1436,7 +1456,7 @@ fn another_application_loss_during_each_secondary_repair_stage_blocks() {
             for _ in 0..stage {
                 let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
                 let reply = completion(&command.message);
-                if command.message.properties().unwrap().action == "DoReconfiguration" {
+                if wire::action(&command.message).unwrap() == "DoReconfiguration" {
                     committed = decode_do_reconfiguration_reply(&reply).unwrap().0;
                 }
                 state.observe(command.node, &reply).unwrap();

@@ -213,7 +213,7 @@ async fn native_deletes(fixture: &Fixture) {
     for _ in 0..3 {
         let command = fixture.fm.command().await;
         assert_eq!(
-            command.message.properties().unwrap().action,
+            fube_node::control::wire::action(&command.message).unwrap(),
             "DeleteReplica"
         );
         fixture.fm.complete(&command).await;

@@ -154,12 +154,11 @@ async fn drive(
                 let (stream, source) = accepted?;
                 let node = config.nodes.iter().position(|node| source.ip() == *node.address.ip());
                 if let Some(node) = node.filter(|node| !admitted[*node] && !stopping) {
-                    let channel = fube_transport::accept_unsecured_tcp(
+                    let channel = wire::accept(
                         stream,
-                        wire::composition(true)?,
-                        wire::limits(),
+                        wire::Role::Fm,
                         wire::deadline(),
-                    ).await?;
+                    ).await.map_err(anyhow::Error::msg)?;
                     links[node] = Some(Link::new(
                         channel,
                         config.fm.identity.native().map_err(anyhow::Error::msg)?,
@@ -207,7 +206,7 @@ async fn drive(
                         .await?;
                 } else {
                     ensure!(
-                        response.properties()?.action != "NodeUpAck",
+                        wire::action(&response).map_err(anyhow::Error::msg)? != "NodeUpAck",
                         "NodeUp is missing its original correlated reply context"
                     );
                     link.send(response).await.map_err(anyhow::Error::msg)?;
@@ -217,9 +216,6 @@ async fn drive(
                     incoming.reply.is_none(),
                     "unexpected correlated native request"
                 );
-            }
-            if let Some(handoff) = incoming.handoff.as_mut() {
-                handoff.acknowledge();
             }
         }
         publish(state, previous, observe)?;

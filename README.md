@@ -12,7 +12,8 @@ replica deletion. After matched native Primary application-host loss in a
 fully admitted cohort, it can reconfigure the surviving original replicas and
 publish their new Primary after final native completion. Its deterministic
 reconciliation core and native-channel adapter use the same fube codecs as the
-real nodes. It then restores the failed original node through a fresh replica
+real nodes, with native transport supplied by fube's shared `furpc` session
+adapter. It then restores the failed original node through a fresh replica
 build and native 3/2 re-admission.
 Matched Secondary application-host loss removes that exact replica through a
 same-Primary configuration, then uses the same fresh-replica restoration path
@@ -35,6 +36,12 @@ recover the deployment. A lost original
 channel or invalid completion produces explicit control uncertainty and withdraws
 FM endpoint publication. It does **not** prove that an existing writer stopped.
 Control TCP is unauthenticated and unencrypted; use a trusted, isolated network.
+
+See the [archived feature-parity tracker](docs/feature-parity.md) for missing
+recovery, application and operational capabilities relative to the old stack.
+The [operator restart design](docs/operator-restart-design.md) proposes minimal
+FM authority on KubericSet, watch-driven reconciliation and native recovery;
+it does not change current restart support.
 
 ## Build and basic tests
 

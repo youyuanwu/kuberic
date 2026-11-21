@@ -305,6 +305,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -521,10 +530,11 @@ name = "fube-hosting"
 version = "0.1.0"
 dependencies = [
  "fube-local-host",
- "fube-transport",
  "fubst",
+ "furpc",
  "serde",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 
@@ -545,10 +555,11 @@ dependencies = [
  "fube-hosting",
  "fube-ra",
  "fube-ra-store",
- "fube-transport",
  "fubst",
+ "furpc",
  "serde",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 
@@ -562,8 +573,8 @@ dependencies = [
  "fube-node",
  "fube-ra",
  "fube-ra-store",
- "fube-transport",
  "fubst",
+ "furpc",
  "serde",
  "serde_json",
  "tokio",
@@ -575,8 +586,8 @@ name = "fube-ra"
 version = "0.1.0"
 dependencies = [
  "fube-ra-store",
- "fube-transport",
  "fubst",
+ "furpc",
  "serde",
  "tokio",
 ]
@@ -591,20 +602,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "fube-transport"
-version = "0.1.0"
-dependencies = [
- "fubst",
- "serde",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "fubst"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "furpc"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "fubst",
+ "futures-util",
+ "http",
+ "serde",
+ "tokio",
+ "tower-service",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1174,8 +1191,8 @@ dependencies = [
  "fube-node",
  "fube-node-runner",
  "fube-ra",
- "fube-transport",
  "fubst",
+ "furpc",
  "serde",
  "serde_json",
  "tokio",
@@ -1231,8 +1248,8 @@ dependencies = [
  "fube-node",
  "fube-node-runner",
  "fube-ra",
- "fube-transport",
  "fubst",
+ "furpc",
  "http",
  "k8s-openapi",
  "kube",
@@ -1900,7 +1917,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.23.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",

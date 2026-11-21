@@ -48,9 +48,9 @@ async fn scripted_candidate_redirection_routes_only_final_native_primary_and_com
     assert_disabled(&fixture).await;
     let redirected = fixture.fm.command().await;
     assert_eq!(redirected.node, 2);
-    assert_eq!(
-        fixture.fm.deliver(original.node, &report).await.unwrap(),
-        acknowledgement
+    kuberic_tests::fm::assert_message_eq(
+        &fixture.fm.deliver(original.node, &report).await.unwrap(),
+        &acknowledgement,
     );
     fixture
         .fm
