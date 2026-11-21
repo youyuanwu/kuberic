@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use fube_node::control::wire::{self, Link};
 use fube_ra::protocol::*;
-use fube_transport::{message::Message, Endpoint};
+use furpc::Message;
 use kuberic_fm::{Config, Phase, State, Status};
 use tokio::{
     net::TcpListener,
@@ -14,14 +14,18 @@ use tokio::{
 };
 
 async fn connect(config: &Config, node: usize, instance: u64) -> Link {
-    let channel =
-        Endpoint::unsecured_tcp(config.fm.address.into(), wire::composition(false).unwrap())
-            .unwrap()
-            .local_ip((*config.nodes[node].address.ip()).into())
-            .channel_limits(wire::limits())
-            .connect_until(Instant::now() + Duration::from_secs(3))
-            .await
-            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket
+        .bind((*config.nodes[node].address.ip(), 0).into())
+        .unwrap();
+    let stream = tokio::time::timeout_at(deadline, socket.connect(config.fm.address.into()))
+        .await
+        .unwrap()
+        .unwrap();
+    let channel = wire::initiate(stream, wire::Role::Node, deadline)
+        .await
+        .unwrap();
     let mut identity = config.nodes[node].identity.native().unwrap();
     identity.instance = instance;
     Link::new(
@@ -34,14 +38,11 @@ async fn connect(config: &Config, node: usize, instance: u64) -> Link {
 }
 
 async fn receive(link: &Link) -> Message {
-    let mut incoming = link
+    let incoming = link
         .receive(Instant::now() + Duration::from_secs(3))
         .await
         .unwrap()
         .expect("native command deadline");
-    if let Some(handoff) = incoming.handoff.as_mut() {
-        handoff.acknowledge();
-    }
     incoming.message
 }
 
@@ -57,16 +58,19 @@ async fn receive_action(link: &Link, action: &str, superseded: &[&Message]) -> M
         loop {
             let message = receive(link).await;
             let stale = superseded.iter().any(|old| {
-                old.body == message.body
-                    && old.properties().unwrap().action == message.properties().unwrap().action
+                old.body()
+                    .segments()
+                    .flatten()
+                    .eq(message.body().segments().flatten())
+                    && wire::action(old).unwrap() == wire::action(&message).unwrap()
             });
-            if !stale && message.properties().unwrap().action == action {
+            if !stale && wire::action(&message).unwrap() == action {
                 return message;
             }
             assert!(
                 stale,
                 "unexpected native action: {:?}",
-                message.properties().unwrap()
+                wire::action(&message).unwrap()
             );
         }
     })
@@ -134,10 +138,14 @@ async fn scripted_lifecycle(redirect: bool) {
         let request = receive(&peers[1]).await;
         if step == 1 || step == 3 {
             let retry = receive(&peers[1]).await;
-            assert_eq!(retry.body, request.body);
+            assert!(retry
+                .body()
+                .segments()
+                .flatten()
+                .eq(request.body().segments().flatten()));
             assert_eq!(
-                retry.properties().unwrap().action,
-                request.properties().unwrap().action
+                wire::action(&retry).unwrap(),
+                wire::action(&request).unwrap()
             );
         }
         assert!(observed.borrow().service_endpoint.is_none());
@@ -210,7 +218,7 @@ async fn scripted_lifecycle(redirect: bool) {
         assert_eq!(observed.borrow().primary_node_id, "3");
         let deletion = receive(&peers[1]).await;
         completed_requests[1].push(deletion.clone());
-        assert_eq!(deletion.properties().unwrap().action, "DeleteReplica");
+        assert_eq!(wire::action(&deletion).unwrap(), "DeleteReplica");
         peers[1].send(support::completion(&deletion)).await.unwrap();
         let build = receive_action(&peers[2], "AddReplica", &[&redirected]).await;
         completed_requests[2].push(build.clone());
@@ -230,7 +238,7 @@ async fn scripted_lifecycle(redirect: bool) {
     for (count, node) in order.into_iter().enumerate() {
         let superseded = completed_requests[node].iter().collect::<Vec<_>>();
         let request = receive_action(&peers[node], "DeleteReplica", &superseded).await;
-        assert_eq!(request.properties().unwrap().action, "DeleteReplica");
+        assert_eq!(wire::action(&request).unwrap(), "DeleteReplica");
         assert!(observed.borrow().service_endpoint.is_none());
         peers[node]
             .send(support::completion(&request))

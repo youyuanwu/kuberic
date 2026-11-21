@@ -1,8 +1,9 @@
 use std::time::Duration;
 
+use fube_node::control::wire;
 use fube_ra::protocol::*;
-use fube_transport::message::Message;
 use fubst::serde::ObjectArray;
+use furpc::Message;
 use kuberic_fm::{Config, Fm, Identity, Placement, ServiceConfig, State};
 
 pub fn config() -> Config {
@@ -165,7 +166,7 @@ pub fn current_app_host_loss(
 }
 
 pub fn completion(message: &Message) -> Message {
-    match message.properties().unwrap().action.as_str() {
+    match wire::action(message).unwrap().as_str() {
         "AddPrimary" => add_primary_reply_message(
             &ready_reply(&decode_add_primary(message).unwrap().0),
             Owner::Fm,
@@ -202,6 +203,26 @@ pub fn completion(message: &Message) -> Message {
         }
         action => panic!("unexpected scripted command {action}"),
     }
+}
+
+pub fn assert_message_eq(left: &Message, right: &Message) {
+    assert!(
+        left.headers()
+            .records()
+            .map(|header| (header.id(), header.value()))
+            .eq(right
+                .headers()
+                .records()
+                .map(|header| (header.id(), header.value()))),
+        "native headers differ: {left:?} != {right:?}"
+    );
+    assert!(
+        left.body()
+            .segments()
+            .flatten()
+            .eq(right.body().segments().flatten()),
+        "native bodies differ: {left:?} != {right:?}"
+    );
 }
 
 pub fn serving(state: &mut State) -> Vec<(usize, Message)> {

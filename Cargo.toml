@@ -28,7 +28,7 @@ fube-local-host = { path = "fube/crates/libs/fube-local-host" }
 fube-node = { path = "fube/crates/libs/fube-node" }
 fube-node-runner = { path = "fube/crates/tools/fube-node-runner" }
 fube-ra = { path = "fube/crates/libs/fube-ra" }
-fube-transport = { path = "fube/crates/libs/fube-transport" }
+furpc = { path = "fube/crates/libs/furpc" }
 fubst = { path = "fube/crates/libs/fubst" }
 kuberic-fm = { path = "kuberic-fm" }
 kuberic-operator = { path = "kuberic-operator" }

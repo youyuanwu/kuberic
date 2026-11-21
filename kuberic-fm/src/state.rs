@@ -3,8 +3,8 @@ use std::{collections::VecDeque, time::Duration};
 use anyhow::{bail, ensure, Context, Result};
 use fube_node::control::wire;
 use fube_ra::protocol::*;
-use fube_transport::message::Message;
 use fubst::serde::ObjectArray;
+use furpc::{Body, Message};
 use serde::Serialize;
 
 use crate::Config;
@@ -52,11 +52,34 @@ pub struct Switchover {
     pub completed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Outbound {
     pub node: usize,
     pub message: Message,
 }
+
+impl PartialEq for Outbound {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node
+            && self
+                .message
+                .headers()
+                .records()
+                .map(|header| (header.id(), header.value()))
+                .eq(other
+                    .message
+                    .headers()
+                    .records()
+                    .map(|header| (header.id(), header.value())))
+            && self.message.body().segments().flatten().eq(other
+                .message
+                .body()
+                .segments()
+                .flatten())
+    }
+}
+
+impl Eq for Outbound {}
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -86,7 +109,7 @@ struct Pending {
 struct Completion {
     node: usize,
     action: String,
-    body: Vec<u8>,
+    body: Body,
 }
 
 struct CandidateChange {
@@ -325,7 +348,7 @@ impl State {
         ensure!(
             now - pending.started < Duration::from_millis(self.config.operation_timeout_ms),
             "native {} semantic reply timed out",
-            pending.outbound.message.properties()?.action
+            wire::action(&pending.outbound.message).map_err(anyhow::Error::msg)?
         );
         if pending
             .sent
@@ -539,24 +562,24 @@ impl State {
         wire::predecode(message).map_err(anyhow::Error::msg)?;
         let generation = self.config.generation()?;
         let mut generations = message
-            .headers
-            .iter()
-            .filter(|header| header.id == GENERATION_HEADER);
+            .headers()
+            .records()
+            .filter(|header| header.id().get() == GENERATION_HEADER);
         if let Some(header) = generations.next() {
             ensure!(
                 generations.next().is_none()
-                    && wire::decode::<GenerationHeader>(&header.value)
+                    && wire::decode::<GenerationHeader>(header.value())
                         .map_err(anyhow::Error::msg)?
                         == generation,
                 "foreign, stale or duplicate FM generation"
             );
         }
-        let properties = message.properties()?;
         ensure!(
-            properties.actor == FM_ACTOR,
+            message.headers().effective().actor.get() == FM_ACTOR,
             "foreign native FM message actor"
         );
-        let action = properties.action.as_str();
+        let action = wire::action(message).map_err(anyhow::Error::msg)?;
+        let action = action.as_str();
         ensure!(
             self.bootstrapped[node] || matches!(action, "NodeUp" | "ReplicaUp"),
             "node report arrived before fresh bootstrap completed"
@@ -716,7 +739,11 @@ impl State {
                 if self.completed.iter().any(|completed| {
                     completed.node == node
                         && completed.action == action
-                        && completed.body == message.body
+                        && completed
+                            .body
+                            .segments()
+                            .flatten()
+                            .eq(message.body().segments().flatten())
                 }) {
                     return Ok(None);
                 }
@@ -737,7 +764,7 @@ impl State {
                 self.completed.push_back(Completion {
                     node,
                     action: action.to_owned(),
-                    body: message.body.clone(),
+                    body: message.body().clone(),
                 });
                 self.pending = None;
                 None

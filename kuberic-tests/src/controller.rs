@@ -147,16 +147,12 @@ impl ScriptedFm {
             })
             .unwrap_or(outbound.node);
         session.state.observe(source, &reply).unwrap();
-        if outbound.message.properties().unwrap().action == "DoReconfiguration" {
+        if fube_node::control::wire::action(&outbound.message).unwrap() == "DoReconfiguration" {
             session.configured = Some(decode_do_reconfiguration_reply(&reply).unwrap().0);
         }
     }
 
-    pub async fn deliver(
-        &self,
-        node: usize,
-        message: &fube_transport::message::Message,
-    ) -> Option<fube_transport::message::Message> {
+    pub async fn deliver(&self, node: usize, message: &furpc::Message) -> Option<furpc::Message> {
         self.session
             .lock()
             .await
@@ -373,10 +369,8 @@ impl ProcessApi for ProcessEvidence {
     }
 }
 
-pub fn native_completion(
-    message: &fube_transport::message::Message,
-) -> fube_transport::message::Message {
-    let action = message.properties().unwrap().action;
+pub fn native_completion(message: &furpc::Message) -> furpc::Message {
+    let action = fube_node::control::wire::action(message).unwrap();
     if action == "DeleteReplica" {
         let request = decode_delete_replica(message).unwrap().0.replica.0;
         return delete_replica_reply_message(

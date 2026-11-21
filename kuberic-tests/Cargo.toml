@@ -16,9 +16,10 @@ path = "tests/processes.rs"
 anyhow.workspace = true
 async-trait.workspace = true
 fube-local-host.workspace = true
+fube-node.workspace = true
 fube-node-runner.workspace = true
 fube-ra.workspace = true
-fube-transport.workspace = true
+furpc.workspace = true
 fubst.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
@@ -33,5 +34,4 @@ tempfile.workspace = true
 tower.workspace = true
 
 [dev-dependencies]
-fube-node.workspace = true
 serde.workspace = true
