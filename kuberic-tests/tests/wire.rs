@@ -113,8 +113,10 @@ async fn scripted_lifecycle(redirect: bool) {
     let mut peers = Vec::new();
     for node in 0..3 {
         let link = connect(&config, node, 1).await;
-        let reply = link.request(support::node_up(&config, node)).await.unwrap();
-        let (ack, generation) = decode_node_up_ack(&reply).unwrap();
+        let (ack, generation) = link
+            .node_up(&decode_node_up(&support::node_up(&config, node)).unwrap())
+            .await
+            .unwrap();
         ack.validate_fresh_activated(&FabricVersionInstance::native_default())
             .unwrap();
         assert_eq!(generation, config.generation().unwrap());
@@ -274,7 +276,10 @@ async fn native_source_incarnation_mismatch_fails_without_placement_or_reconnect
         },
     ));
     let peer = connect(&config, 0, 2).await;
-    assert!(peer.request(support::node_up(&config, 0)).await.is_err());
+    assert!(peer
+        .node_up(&decode_node_up(&support::node_up(&config, 0)).unwrap())
+        .await
+        .is_err());
     let error = tokio::time::timeout(Duration::from_secs(4), fm)
         .await
         .unwrap()

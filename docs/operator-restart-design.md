@@ -618,7 +618,7 @@ from existing receipts; it adds no persisted cleanup stage.
 ## 9. Required upstream fube contracts
 
 The pinned fube baseline is
-`d8a56a99a2b3c6f38875577af9737413f6568e89`. It already has live-session
+`bcece97213f287f96bcb76b8a7e0fa82a0dbce24`. It already has live-session
 generation/LFUM machinery, but its
 [documented scope](../fube/docs/cluster/ExternalFmContainerNode.md#ordinary-fm-lfum-status)
 explicitly does not make that startup recovery or production FM rebuild.
@@ -634,8 +634,10 @@ does not establish the cross-session recovery contracts below. The extraction
 does not replace this design's pure decision core and Kubernetes CAS boundary.
 
 Native control now uses the shared `furpc` session adapter; the former
-`fube-transport` crate is retired. Kuberic follows that transport API without
-changing its FM authority or adding reconnect/restart support.
+`fube-transport` crate is retired. This baseline also provides typed FM/Node
+intake, outbound clients and startup-inventory exchanges. Kuberic follows the
+supported bootstrap API without changing its FM authority or adding
+reconnect/restart support.
 
 Before Kuberic may enable recovery:
 
