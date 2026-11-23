@@ -279,8 +279,12 @@ transport paths with `furpc` and retires `fube-transport`. Kuberic migrates its
 FM/session adapter and scripted fixtures to that shared API. Replay equality
 compares ordered header records and visible body bytes rather than body segment
 boundaries; correlated native replies remain owned by the original session.
-Relative fube references resolve to this latest checkout. The R1-R6 cross-session
-requirements remain unimplemented gates.
+The current pin `bcece97213f287f96bcb76b8a7e0fa82a0dbce24` adds typed FM/Node
+intake, outbound clients and startup-inventory exchanges, together with typed
+runtime/Hosting IPC. Kuberic's wire fixtures use the typed NodeUp bootstrap call
+in place of the removed raw request API. Relative fube references resolve to
+this latest checkout. The R1-R6 cross-session requirements remain unimplemented
+gates.
 
 ## Alternatives not selected
 
